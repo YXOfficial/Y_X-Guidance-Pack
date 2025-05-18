@@ -1,6 +1,6 @@
-# CFG-Zero for Stable Diffusion WebUI (Forge)
+# CFG-Zero for Stable Diffusion WebUI
 
-This is an extension for the [Stable Diffusion WebUI (Forge)](https://github.com/lllyasviel/stable-diffusion-webui-forge) that implements a version of CFG-Zero guidance.
+This is an extension for the Stable Diffusion WebUIthat implements a version of CFG-Zero guidance.
 
 **This is a quick patch and adaptation based on the concepts presented in the research paper and repository: [CFG-Zero*: A new guidance algorithm for diffusion models (CFG-Zero\*)](https://github.com/WeichenFan/CFG-Zero-star).**
 
