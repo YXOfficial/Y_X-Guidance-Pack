@@ -1,201 +1,158 @@
 # --- START OF FILE cfg_zero_script.py ---
 import logging
 import sys
-import traceback # Added for better error reporting in on_before_ui
+import traceback
 import gradio as gr
 from modules import scripts, script_callbacks
 from functools import partial
 from typing import Any
 
-# We'll import the patching class from another file
 from CFGZERO.nodes_cfg_zero import CFGZeroNode
 
 class CFGZeroScript(scripts.Script):
     def __init__(self):
         super().__init__()
-        self.enabled = False
-        self.zero_init_first_step = False # Default value for the new option
-        self.cfg_zero_node_instance = CFGZeroNode() # Instantiate the node logic
+        # --- Khởi tạo giá trị mặc định cho tất cả các tùy chọn ---
+        self.cfg_zero_enabled = False
+        self.zero_init_first_step = False
+        self.fdg_enabled = False
+        self.w_low = 1.0
+        self.w_high = 1.0
+        self.fdg_levels = 3
+        
+        self.node_instance = CFGZeroNode()
 
-    sorting_priority = 15.2 # Slightly different from Mahiro to avoid conflict if both are somehow active
+    sorting_priority = 15.2
 
     def title(self):
-        return "CFG-Zero Guidance"
+        return "CFG-Zero / FDG Guidance"
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
 
     def ui(self, *args, **kwargs):
         with gr.Accordion(open=False, label=self.title()):
-            gr.HTML("<p><i>Toggle CFG-Zero guidance. Modifies how conditional and unconditional guidance are combined.</i></p>")
-            enabled = gr.Checkbox(label="Enable CFG-Zero", value=self.enabled)
-            zero_init_first_step = gr.Checkbox(label="Zero Init First Step (Experimental)", value=self.zero_init_first_step)
+            gr.Markdown("Bật và cấu hình CFG-Zero và/hoặc Frequency-Decoupled Guidance (FDG).")
+            
+            # --- Nhóm CFG-Zero ---
+            with gr.Group():
+                gr.Markdown("### CFG-Zero Settings")
+                cfg_zero_enabled = gr.Checkbox(label="Enable CFG-Zero", value=self.cfg_zero_enabled)
+                zero_init_first_step = gr.Checkbox(label="Zero Init First Step (Experimental)", value=self.zero_init_first_step)
 
-        enabled.change(
-            lambda x: self.update_enabled(x),
-            inputs=[enabled],
-            outputs=None
-        )
-        zero_init_first_step.change(
-            lambda x: self.update_zero_init(x),
-            inputs=[zero_init_first_step],
-            outputs=None
-        )
-        # Store controls for process_before_every_sampling
-        self.ui_controls = [enabled, zero_init_first_step]
+            # --- Nhóm FDG ---
+            with gr.Group():
+                gr.Markdown("### Frequency-Decoupled Guidance (FDG) Settings")
+                fdg_enabled = gr.Checkbox(label="Enable FDG (Overrides CFG Scale)", value=self.fdg_enabled)
+                w_low = gr.Slider(label="w_low (Low-Frequency Guidance)", minimum=0.0, maximum=10.0, step=0.1, value=self.w_low)
+                w_high = gr.Slider(label="w_high (High-Frequency Guidance)", minimum=0.0, maximum=10.0, step=0.1, value=self.w_high)
+                fdg_levels = gr.Slider(label="FDG Pyramid Levels", minimum=2, maximum=8, step=1, value=self.fdg_levels)
+        
+        # --- Kết nối các hàm `change` đơn giản ---
+        cfg_zero_enabled.change(lambda x: setattr(self, 'cfg_zero_enabled', x), inputs=[cfg_zero_enabled], outputs=None)
+        zero_init_first_step.change(lambda x: setattr(self, 'zero_init_first_step', x), inputs=[zero_init_first_step], outputs=None)
+        fdg_enabled.change(lambda x: setattr(self, 'fdg_enabled', x), inputs=[fdg_enabled], outputs=None)
+        w_low.change(lambda x: setattr(self, 'w_low', x), inputs=[w_low], outputs=None)
+        w_high.change(lambda x: setattr(self, 'w_high', x), inputs=[w_high], outputs=None)
+        fdg_levels.change(lambda x: setattr(self, 'fdg_levels', x), inputs=[fdg_levels], outputs=None)
+        
+        self.ui_controls = [cfg_zero_enabled, zero_init_first_step, fdg_enabled, w_low, w_high, fdg_levels]
         return self.ui_controls
 
-    def update_enabled(self, value):
-        self.enabled = value
-        logging.debug(f"CFG-Zero: Enabled toggled to: {self.enabled}")
-
-    def update_zero_init(self, value):
-        self.zero_init_first_step = value
-        logging.debug(f"CFG-Zero: Zero Init First Step toggled to: {self.zero_init_first_step}")
-
     def process_before_every_sampling(self, p, *args, **kwargs):
-        # args will contain the values from self.ui_controls in order
-        if len(args) >= 2:
-            self.enabled = args[0]
-            self.zero_init_first_step = args[1]
-        elif len(args) == 1: # backward compatibility or partial XYZ
-            self.enabled = args[0]
-            # self.zero_init_first_step remains its last UI-set value or default
-            logging.warning("CFG-Zero: Not enough arguments for zero_init, using current value.")
+        if len(args) >= 6:
+            (self.cfg_zero_enabled, self.zero_init_first_step, 
+             self.fdg_enabled, self.w_low, self.w_high, self.fdg_levels) = args[:6]
         else:
-            logging.warning("CFG-Zero: Not enough arguments provided to process_before_every_sampling, using current values.")
+            logging.warning("CFG-Zero/FDG: Not enough arguments provided.")
 
-        # Handle XYZ Grid
+        # Xử lý XYZ Grid
         xyz_settings = getattr(p, "_cfg_zero_xyz", {})
-        if "enabled" in xyz_settings:
-            self.enabled = xyz_settings["enabled"].lower() == "true" # XYZ grid often sends strings
-        if "zero_init" in xyz_settings:
-            self.zero_init_first_step = xyz_settings["zero_init"].lower() == "true"
+        if "cfg_zero_enabled" in xyz_settings: self.cfg_zero_enabled = str(xyz_settings["cfg_zero_enabled"]).lower() == "true"
+        if "zero_init" in xyz_settings: self.zero_init_first_step = str(xyz_settings["zero_init"]).lower() == "true"
+        if "fdg_enabled" in xyz_settings: self.fdg_enabled = str(xyz_settings["fdg_enabled"]).lower() == "true"
+        if "w_low" in xyz_settings: self.w_low = float(xyz_settings["w_low"])
+        if "w_high" in xyz_settings: self.w_high = float(xyz_settings["w_high"])
+        if "fdg_levels" in xyz_settings: self.fdg_levels = int(xyz_settings["fdg_levels"])
 
-        # Always start with a fresh clone of the original unet
-        # This ensures that if CFG-Zero is disabled, or if other scripts modify the unet,
-        # we are starting from a known state.
-        original_unet = p.sd_model.forge_objects.unet # This is already a clone if patched before
-                                                      # or the original one if not.
-                                                      # To be safe, we might want to access the true original,
-                                                      # but Forge's system usually handles this by re-cloning.
-                                                      # Let's assume p.sd_model.forge_objects.unet is the one to modify/revert.
-
-        current_unet = p.sd_model.forge_objects.unet
-        # Check if our patch is already applied, to avoid re-patching unnecessarily or to remove it.
-        # This requires the patch function to mark the model, or for us to rely on disabling.
-        # For simplicity, we will re-apply or reset based on 'enabled' state.
-        # It's crucial that CFGZeroNode().patch() CLONES the model internally.
-        
-        # The most robust way is to ensure we operate on a fresh clone if enabling,
-        # or restore to original if disabling.
-        # Forge's UNet is often a clone. To get the *actual* base unet for cloning:
-        # base_unet = p.sd_model.forge_objects.unet_for_sampler_opt_clone() # This gets the fresh unet
-        # However, if other patches are applied, this might undo them.
-        # The Mahiro example's approach `unet = p.sd_model.forge_objects.unet.clone()` and then
-        # `p.sd_model.forge_objects.unet = unet` (if not enabled, it's a fresh clone)
-        # or `p.sd_model.forge_objects.unet = patched_unet` (if enabled) is standard.
-
-        # Ensure we have the base unet for operations
-        # Note: p.sd_model.forge_objects.unet is already a working clone.
-        # If we call .clone() on it, we get a clone of potentially already patched unet.
-        # To be absolutely safe and ensure no double patching or interference:
-        if hasattr(p, '_original_unet_before_cfg_zero'):
-            p.sd_model.forge_objects.unet = p._original_unet_before_cfg_zero.clone()
+        # Khôi phục unet gốc trước khi patch
+        if hasattr(p, '_original_unet_before_custom_guidance'):
+            p.sd_model.forge_objects.unet = p._original_unet_before_custom_guidance.clone()
         else:
-            # Store the state of the unet *before* our script potentially modifies it
-            # This assumes no other script with higher priority has already cloned and stored its own original
-            p._original_unet_before_cfg_zero = p.sd_model.forge_objects.unet.clone()
-        
-        unet_to_patch = p.sd_model.forge_objects.unet # This is now a fresh clone from original or previous state
+            p._original_unet_before_custom_guidance = p.sd_model.forge_objects.unet.clone()
 
-        if not self.enabled:
-            # If it was previously enabled and patched by us, ensure model_sampler_post_cfg_function is cleared.
-            # The simplest way is to re-assign the cloned unet_to_patch (which is from p._original_unet_before_cfg_zero)
-            # Or, if the CFGZeroNode.patch method returns the original model if not enabled, that works too.
-            # The Mahiro example just re-assigns a fresh clone.
-            # Clearing a specific post_cfg_function:
-            if hasattr(unet_to_patch, "_cfg_zero_patched"): # A marker we can set
-                unet_to_patch.set_model_sampler_post_cfg_function(None, "cfg_zero_guidance") # Name it
-                delattr(unet_to_patch, "_cfg_zero_patched")
-            p.sd_model.forge_objects.unet = unet_to_patch # effectively p._original_unet_before_cfg_zero.clone()
-            if "cfg_zero_enabled" in p.extra_generation_params:
-                del p.extra_generation_params["cfg_zero_enabled"]
-            if "cfg_zero_init_first_step" in p.extra_generation_params:
-                del p.extra_generation_params["cfg_zero_init_first_step"]
-            logging.debug(f"CFG-Zero: Disabled. UNet restored.")
+        # Dọn dẹp metadata trước
+        p.extra_generation_params.pop("CFG-Zero Enabled", None)
+        p.extra_generation_params.pop("CFG-Zero Init First Step", None)
+        p.extra_generation_params.pop("FDG Enabled", None)
+        p.extra_generation_params.pop("FDG w_low", None)
+        p.extra_generation_params.pop("FDG w_high", None)
+        p.extra_generation_params.pop("FDG Levels", None)
+        
+        # Nếu không có gì được bật, không patch và thoát
+        if not self.cfg_zero_enabled and not self.fdg_enabled:
+            logging.debug("CFG-Zero/FDG: Both disabled. No patch applied.")
             return
 
-        logging.debug(f"CFG-Zero: Enabling with Zero Init: {self.zero_init_first_step}")
-        
-        # Pass the zero_init_first_step setting to the patch method
-        patched_unet = self.cfg_zero_node_instance.patch(
-            unet_to_patch, # Pass the current unet (which should be a fresh clone)
-            zero_init_first_step=self.zero_init_first_step
-        )[0] # patch returns a tuple (model,)
+        # Gọi hàm patch với tất cả các tham số
+        patched_unet = self.node_instance.patch(
+            p.sd_model.forge_objects.unet,
+            cfg_zero_enabled=self.cfg_zero_enabled,
+            zero_init_first_step=self.zero_init_first_step,
+            fdg_enabled=self.fdg_enabled,
+            w_low=self.w_low,
+            w_high=self.w_high,
+            fdg_levels=int(self.fdg_levels)
+        )[0]
         
         p.sd_model.forge_objects.unet = patched_unet
-        setattr(p.sd_model.forge_objects.unet, "_cfg_zero_patched", True) # Mark it
 
-        p.extra_generation_params.update({
-            "cfg_zero_enabled": True,
-            "cfg_zero_init_first_step": self.zero_init_first_step,
-        })
-        logging.debug(f"CFG-Zero: Enabled: {self.enabled}, Zero Init: {self.zero_init_first_step}. UNet Patched.")
+        # Cập nhật metadata nếu cần
+        if self.cfg_zero_enabled:
+            p.extra_generation_params["CFG-Zero Enabled"] = self.cfg_zero_enabled
+            p.extra_generation_params["CFG-Zero Init First Step"] = self.zero_init_first_step
+        if self.fdg_enabled:
+            p.extra_generation_params["FDG Enabled"] = self.fdg_enabled
+            p.extra_generation_params["FDG w_low"] = self.w_low
+            p.extra_generation_params["FDG w_high"] = self.w_high
+            p.extra_generation_params["FDG Levels"] = int(self.fdg_levels)
+        
+        logging.debug(f"CFG-Zero/FDG: Patch applied. CFG-Zero: {self.cfg_zero_enabled}, FDG: {self.fdg_enabled}")
         return
 
-# --- XYZ Grid Integration ---
-def cfg_zero_set_value(p, x: Any, xs: Any, *, field: str):
+# --- XYZ Grid Integration (Cần mở rộng) ---
+def custom_guidance_set_value(p, x: Any, xs: Any, *, field: str):
     if not hasattr(p, "_cfg_zero_xyz"):
         p._cfg_zero_xyz = {}
-    # XYZ grid sends strings "True", "False". Convert to bool for our script.
-    # The script's process_before_every_sampling will handle string "true"/"false"
     p._cfg_zero_xyz[field] = str(x)
 
-
-def make_cfg_zero_axis_on_xyz_grid():
+def make_custom_guidance_axis_on_xyz_grid():
     xyz_grid = None
     for script_data in scripts.scripts_data:
-        if script_data.script_class.__module__ in ("xyz_grid.py", "xy_grid.py") : # Support both common names
+        if script_data.script_class.__module__ in ("xyz_grid.py", "xy_grid.py"):
             xyz_grid = script_data.module
             break
+    if xyz_grid is None: return
 
-    if xyz_grid is None:
-        logging.warning("CFG-Zero: XYZ Grid script not found.")
-        return
-
-    # Check if options already exist to prevent duplicates
-    if any(x.label.startswith("(CFG-Zero)") for x in xyz_grid.axis_options):
-        logging.info("CFG-Zero: XYZ Grid options already registered.")
+    if any(x.label.startswith("(CustomGuidance)") for x in xyz_grid.axis_options):
         return
         
-    cfg_zero_options = [
-        xyz_grid.AxisOption(
-            label="(CFG-Zero) Enabled",
-            type=str, # Keep as string for XYZ, parsing happens in process_before_every_sampling
-            apply=partial(cfg_zero_set_value, field="enabled"),
-            choices=lambda: ["True", "False"]
-        ),
-        xyz_grid.AxisOption(
-            label="(CFG-Zero) Zero Init First Step",
-            type=str, # Keep as string
-            apply=partial(cfg_zero_set_value, field="zero_init"),
-            choices=lambda: ["True", "False"]
-        ),
+    options = [
+        xyz_grid.AxisOption(label="(CustomGuidance) CFG-Zero Enabled", type=str, apply=partial(custom_guidance_set_value, field="cfg_zero_enabled"), choices=lambda: ["True", "False"]),
+        xyz_grid.AxisOption(label="(CustomGuidance) Zero Init", type=str, apply=partial(custom_guidance_set_value, field="zero_init"), choices=lambda: ["True", "False"]),
+        xyz_grid.AxisOption(label="(CustomGuidance) FDG Enabled", type=str, apply=partial(custom_guidance_set_value, field="fdg_enabled"), choices=lambda: ["True", "False"]),
+        xyz_grid.AxisOption(label="(CustomGuidance) FDG w_low", type=float, apply=partial(custom_guidance_set_value, field="w_low")),
+        xyz_grid.AxisOption(label="(CustomGuidance) FDG w_high", type=float, apply=partial(custom_guidance_set_value, field="w_high")),
+        xyz_grid.AxisOption(label="(CustomGuidance) FDG Levels", type=int, apply=partial(custom_guidance_set_value, field="fdg_levels")),
     ]
-    xyz_grid.axis_options.extend(cfg_zero_options)
-    logging.info("CFG-Zero: XYZ Grid options successfully registered.")
+    xyz_grid.axis_options.extend(options)
+    logging.info("Custom Guidance (CFG-Zero/FDG): XYZ Grid options registered.")
 
-
-def on_cfg_zero_before_ui():
+def on_custom_guidance_before_ui():
     try:
-        make_cfg_zero_axis_on_xyz_grid()
+        make_custom_guidance_axis_on_xyz_grid()
     except Exception:
-        error = traceback.format_exc()
-        print(
-            f"[-] CFG-Zero Script: Error setting up XYZ Grid options:\n{error}",
-            file=sys.stderr,
-        )
+        print(f"[-] Custom Guidance Script: Error setting up XYZ Grid options:\n{traceback.format_exc()}", file=sys.stderr)
 
-script_callbacks.on_before_ui(on_cfg_zero_before_ui)
+script_callbacks.on_before_ui(on_custom_guidance_before_ui)
 # --- END OF FILE cfg_zero_script.py ---
