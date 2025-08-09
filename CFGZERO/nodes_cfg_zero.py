@@ -1,106 +1,136 @@
 # --- START OF FILE nodes_cfg_zero.py ---
 import torch
 import logging
+import kornia
+from kornia.geometry.transform import build_laplacian_pyramid
+
+def build_image_from_pyramid(pyramid):
+    img = pyramid[-1]
+    for i in range(len(pyramid) - 2, -1, -1):
+        upsampled = torch.nn.functional.interpolate(img, size=pyramid[i].shape[-2:], mode='bilinear', align_corners=False)
+        img = upsampled + pyramid[i]
+    return img
 
 class CFGZeroNode:
     @classmethod
-    def INPUT_TYPES(s): # Not strictly needed for WebUI script use, but good practice
+    def INPUT_TYPES(s):
         return {
             "required": {
                 "model": ("MODEL",),
+                # --- Tham số cho CFG-Zero ---
+                "cfg_zero_enabled": ("BOOLEAN", {"default": False}),
                 "zero_init_first_step": ("BOOLEAN", {"default": False}),
+                # --- Tham số cho FDG ---
+                "fdg_enabled": ("BOOLEAN", {"default": False}),
+                "w_low": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1, "round": 0.01}),
+                "w_high": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1, "round": 0.01}),
+                "fdg_levels": ("INT", {"default": 3, "min": 2, "max": 8, "step": 1}),
             }
         }
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
-    CATEGORY = "advanced/model_patches" # Or similar
-    DESCRIPTION = "Applies CFG-Zero guidance scaling."
+    CATEGORY = "advanced/model_patches"
+    DESCRIPTION = "Applies CFG-Zero and/or FDG guidance scaling."
 
-    def patch(self, model, zero_init_first_step: bool = False):
+    def patch(self, model, cfg_zero_enabled: bool = False, zero_init_first_step: bool = False, 
+              fdg_enabled: bool = False, w_low: float = 1.0, w_high: float = 1.0, fdg_levels: int = 3):
+        
+        # Nếu không có tính năng nào được bật, không cần patch mô hình
+        if not cfg_zero_enabled and not fdg_enabled:
+            return (model,) # Trả về mô hình gốc
+
         m = model.clone()
         
-        # Capture initial sigma for first step detection
-        # sigma_max is the sigma for the first step (highest noise)
         try:
-            # For UNet models (typical SD)
             initial_sigma = m.model.model_sampling.sigma_max 
         except AttributeError:
-            # Fallback or error if model structure is different (e.g. VAE, CLIP)
-            logging.warning("CFG-Zero: Could not determine initial_sigma from model. First step zero-init might not work correctly.")
-            initial_sigma = float('inf') # Make first step detection unlikely if sigma_max is not found
+            logging.warning("CFG-Zero/FDG: Could not determine initial_sigma.")
+            initial_sigma = float('inf')
 
-        # This is the function that will be called by the sampler
-        def cfg_zero_guidance_function(args):
+        def guidance_function(args):
             cond_scale = args['cond_scale']
-            cond_denoised = args['cond_denoised']     # Corresponds to noise_pred_text
-            uncond_denoised = args['uncond_denoised'] # Corresponds to noise_pred_uncond
-            # sigma_t = args['sigma'] # Current sigma for this step (tensor)
-            # x = args['x'] # Current latent
+            cond_denoised = args['cond_denoised']
+            uncond_denoised = args['uncond_denoised']
 
-            # First step zero-init logic
-            if zero_init_first_step:
-                current_sigma_val = args['sigma'][0].item() # Get scalar value
-                # Compare with a small tolerance due to potential float precision issues
+            # --- Logic Zero Init (chỉ hoạt động khi CFG-Zero bật) ---
+            if cfg_zero_enabled and zero_init_first_step:
+                current_sigma_val = args['sigma'][0].item()
                 if abs(current_sigma_val - initial_sigma) < 1e-5:
-                    logging.debug(f"CFG-Zero: Applying zero_init for first step (sigma: {current_sigma_val})")
-                    return uncond_denoised * 0.0 # Perform zero init
+                    return uncond_denoised * 0.0
 
-            # Reshape for broadcasting if necessary, but usually not needed as operations are element-wise
-            # Original shapes are typically (batch_size, channels, height, width)
-            
-            # Keep batch dimension, flatten others for st_star calculation
-            # Ensure original_shape and batch_size are correctly derived
-            original_shape = cond_denoised.shape
-            if len(original_shape) == 0: # Should not happen with tensors
-                return uncond_denoised + cond_scale * (cond_denoised - uncond_denoised) # Fallback to standard CFG
+            # --- Bước 1: Xác định dự đoán cơ sở (base_pred) và hướng điều hướng (guidance_direction) ---
+            if cfg_zero_enabled:
+                original_shape = cond_denoised.shape
+                batch_size = original_shape[0] if len(original_shape) > 0 else 1
+                
+                positive_flat = cond_denoised.reshape(batch_size, -1)
+                negative_flat = uncond_denoised.reshape(batch_size, -1)
+                dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
+                squared_norm_negative = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
+                st_star = dot_product / squared_norm_negative
+                st_star_reshaped = st_star.view(batch_size, *([1] * (len(original_shape) - 1)))
+                
+                base_pred = uncond_denoised * st_star_reshaped
+                guidance_direction = cond_denoised - base_pred
+            else:
+                # Nếu CFG-Zero tắt, sử dụng CFG chuẩn
+                base_pred = uncond_denoised
+                guidance_direction = cond_denoised - uncond_denoised
 
-            batch_size = original_shape[0] if len(original_shape) > 0 else 1
+            # --- Bước 2: Áp dụng FDG nếu được bật ---
+            if fdg_enabled:
+                logging.debug(f"FDG: Applying w_low={w_low}, w_high={w_high}")
+                try:
+                    # Tính toán hai phiên bản của guidance term
+                    guidance_low_freq_scaled = guidance_direction * w_low
+                    guidance_high_freq_scaled = guidance_direction * w_high
 
-            # Flatten starting from the first dimension (channels)
-            # (B, C, H, W) -> (B, C*H*W)
-            positive_flat = cond_denoised.reshape(batch_size, -1)
-            negative_flat = uncond_denoised.reshape(batch_size, -1)
+                    # Lấy thành phần tần số thấp từ mỗi phiên bản
+                    # Chúng ta chỉ cần thành phần tần số thấp (residual) của pyramid
+                    levels = max(2, int(fdg_levels))
+                    
+                    low_freq_part_from_low = build_laplacian_pyramid(guidance_low_freq_scaled, levels)[-1]
+                    low_freq_part_from_high = build_laplacian_pyramid(guidance_high_freq_scaled, levels)[-1]
+                    
+                    # Phiên bản "high_freq_scaled" sẽ là nền, và chúng ta sẽ thay thế phần tần số thấp của nó
+                    # bằng phần tần số thấp đã được scale bởi w_low.
+                    #
+                    # final = (guidance_high_freq_scaled - low_freq_part_from_high) + low_freq_part_from_low
+                    #   ^-- đây là thành phần tần số cao của phiên bản high
+                    #                                                               ^-- đây là thành phần tần số thấp của phiên bản low
+                    # Phép toán này bảo toàn kích thước vì không có up/down sampling và tái tạo.
+                    
+                    # QUICK FIX CHO LỖI KÍCH THƯỚC TRONG PYRAMID
+                    # Đảm bảo các thành phần tần số thấp có kích thước khớp nhau trước khi trừ/cộng
+                    if low_freq_part_from_high.shape != guidance_high_freq_scaled.shape:
+                         low_freq_part_from_high = torch.nn.functional.interpolate(low_freq_part_from_high, size=guidance_high_freq_scaled.shape[-2:], mode='bilinear', align_corners=False)
+                    
+                    if low_freq_part_from_low.shape != guidance_high_freq_scaled.shape:
+                         low_freq_part_from_low = torch.nn.functional.interpolate(low_freq_part_from_low, size=guidance_high_freq_scaled.shape[-2:], mode='bilinear', align_corners=False)
 
-            # Calculate st_star = (v_cond^T * v_uncond) / ||v_uncond||^2
-            # dot_product: sum over the flattened dimensions for each item in batch
-            dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
-            
-            # squared_norm_negative: sum of squares over flattened dimensions for each item in batch
-            squared_norm_negative = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8 # Epsilon for stability
-
-            st_star = dot_product / squared_norm_negative
-            
-            # Reshape st_star for broadcasting with original tensor shapes
-            # (batch_size, 1) -> (batch_size, 1, 1, 1) for 4D tensors like (B,C,H,W)
-            # This ensures st_star applies correctly element-wise during multiplication
-            st_star_reshaped = st_star.view(batch_size, *([1] * (len(original_shape) - 1)))
-
-            # CFG-Zero formula:
-            # noise_pred = noise_pred_uncond * st_star + guidance_scale * (noise_pred_text - noise_pred_uncond * st_star)
-            # noise_pred = uncond_denoised * st_star_reshaped + \
-            #              cond_scale * (cond_denoised - uncond_denoised * st_star_reshaped)
-            
-            # Alternative interpretation from some discussions (aligns more with scaling the "difference" part):
-            # This is essentially: uncond + st_star * scale * (cond - uncond) - this seems less likely from original paper
-            # The provided snippet is: uncond_p * st_star + scale * (cond_p - uncond_p * st_star)
-            # Let's stick to the snippet's formula.
-
-            combined_pred = uncond_denoised * st_star_reshaped + \
-                            cond_scale * (cond_denoised - uncond_denoised * st_star_reshaped)
+                    # Trộn chúng lại với nhau
+                    high_freq_part = guidance_high_freq_scaled - low_freq_part_from_high
+                    final_guidance_term = (high_freq_part + low_freq_part_from_low) * cond_scale
+                    
+                except Exception as e:
+                    logging.error(f"FDG: Error during frequency blending: {e}. Falling back to standard guidance.")
+                    final_guidance_term = guidance_direction * cond_scale
+            else:
+                # Nếu FDG tắt, sử dụng CFG scale chuẩn
+                final_guidance_term = guidance_direction * cond_scale
+            # --- Bước 3: Kết hợp lại ---
+            combined_pred = base_pred + final_guidance_term
             
             return combined_pred
 
-        # "cfg_zero_guidance" is a unique name for this specific patch
-        m.set_model_sampler_post_cfg_function(cfg_zero_guidance_function, "cfg_zero_guidance")
-        logging.debug(f"CFG-Zero: Model patched with zero_init_first_step = {zero_init_first_step}, initial_sigma_captured = {initial_sigma}")
+        m.set_model_sampler_post_cfg_function(guidance_function, "cfg_zero_fdg_guidance")
+        logging.debug(f"Patched model with CFG-Zero: {cfg_zero_enabled}, FDG: {fdg_enabled}")
         return (m,)
 
-# For ComfyUI compatibility (optional, but good practice)
 NODE_CLASS_MAPPINGS = {
-    "CFGZeroNode": CFGZeroNode
+    "CFGZeroFDGNode": CFGZeroNode
 }
 NODE_DISPLAY_NAME_MAPPINGS = {
-    "CFGZeroNode": "YX-CFG-Zero Guidance Patcher"
+    "CFGZeroFDGNode": "YX-CFG-Zero/FDG Guidance"
 }
-
 # --- END OF FILE nodes_cfg_zero.py ---
