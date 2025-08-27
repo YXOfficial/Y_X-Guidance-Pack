@@ -1,4 +1,4 @@
-# --- START OF FILE cfg_zero_script.py ---
+# --- START OF FILE cfg_zero_script (4).py ---
 import logging
 import sys
 import traceback
@@ -19,82 +19,91 @@ class CFGZeroScript(scripts.Script):
         self.w_low = 1.0
         self.w_high = 1.0
         self.fdg_levels = 3
+        self.s2_guidance_enabled = False
+        self.s2_scale_omega = 0.25
+        self.s2_drop_ratio = 0.1
         
         self.node_instance = CFGZeroNode()
 
     sorting_priority = 15.2
 
     def title(self):
-        return "CFG-Zero / FDG Guidance"
+        return "Custom Guidance (CFG-Zero/FDG/S²)"
 
     def show(self, is_img2img):
         return scripts.AlwaysVisible
 
     def ui(self, *args, **kwargs):
         with gr.Accordion(open=False, label=self.title()):
-            gr.Markdown("Bật và cấu hình CFG-Zero và/hoặc Frequency-Decoupled Guidance (FDG).")
+            gr.Markdown("Bật và cấu hình các phương pháp guidance nâng cao. Chúng có thể được kết hợp.")
             
-            # --- Nhóm CFG-Zero ---
+            with gr.Group():
+                gr.Markdown("### S²-Guidance Settings (Experimental)")
+                gr.Markdown("Dựa trên bài báo 'S²-Guidance'. Giảm thiểu các lỗi do mô hình không chắc chắn. **Làm tăng đáng kể thời gian tạo ảnh.**")
+                s2_guidance_enabled = gr.Checkbox(label="Enable S²-Guidance", value=self.s2_guidance_enabled)
+                s2_scale_omega = gr.Slider(label="S² Scale (ω)", minimum=0.0, maximum=2.0, step=0.05, value=self.s2_scale_omega)
+                s2_drop_ratio = gr.Slider(label="Block Drop Ratio", minimum=0.0, maximum=0.5, step=0.01, value=self.s2_drop_ratio, info="Tỷ lệ khối UNet/DiT bị bỏ qua. Bài báo đề xuất ~0.1 (10%)")
+            
             with gr.Group():
                 gr.Markdown("### CFG-Zero Settings")
                 cfg_zero_enabled = gr.Checkbox(label="Enable CFG-Zero", value=self.cfg_zero_enabled)
                 zero_init_first_step = gr.Checkbox(label="Zero Init First Step (Experimental)", value=self.zero_init_first_step)
 
-            # --- Nhóm FDG ---
             with gr.Group():
                 gr.Markdown("### Frequency-Decoupled Guidance (FDG) Settings")
-                fdg_enabled = gr.Checkbox(label="Enable FDG (Overrides CFG Scale)", value=self.fdg_enabled)
+                fdg_enabled = gr.Checkbox(label="Enable FDG", value=self.fdg_enabled)
                 w_low = gr.Slider(label="w_low (Low-Frequency Guidance)", minimum=0.0, maximum=10.0, step=0.1, value=self.w_low)
                 w_high = gr.Slider(label="w_high (High-Frequency Guidance)", minimum=0.0, maximum=10.0, step=0.1, value=self.w_high)
                 fdg_levels = gr.Slider(label="FDG Pyramid Levels", minimum=2, maximum=8, step=1, value=self.fdg_levels)
         
-        # --- Kết nối các hàm `change` đơn giản ---
         cfg_zero_enabled.change(lambda x: setattr(self, 'cfg_zero_enabled', x), inputs=[cfg_zero_enabled], outputs=None)
         zero_init_first_step.change(lambda x: setattr(self, 'zero_init_first_step', x), inputs=[zero_init_first_step], outputs=None)
         fdg_enabled.change(lambda x: setattr(self, 'fdg_enabled', x), inputs=[fdg_enabled], outputs=None)
         w_low.change(lambda x: setattr(self, 'w_low', x), inputs=[w_low], outputs=None)
         w_high.change(lambda x: setattr(self, 'w_high', x), inputs=[w_high], outputs=None)
         fdg_levels.change(lambda x: setattr(self, 'fdg_levels', x), inputs=[fdg_levels], outputs=None)
+        s2_guidance_enabled.change(lambda x: setattr(self, 's2_guidance_enabled', x), inputs=[s2_guidance_enabled], outputs=None)
+        s2_scale_omega.change(lambda x: setattr(self, 's2_scale_omega', x), inputs=[s2_scale_omega], outputs=None)
+        s2_drop_ratio.change(lambda x: setattr(self, 's2_drop_ratio', x), inputs=[s2_drop_ratio], outputs=None)
         
-        self.ui_controls = [cfg_zero_enabled, zero_init_first_step, fdg_enabled, w_low, w_high, fdg_levels]
+        self.ui_controls = [cfg_zero_enabled, zero_init_first_step, fdg_enabled, w_low, w_high, fdg_levels, 
+                            s2_guidance_enabled, s2_scale_omega, s2_drop_ratio]
         return self.ui_controls
 
     def process_before_every_sampling(self, p, *args, **kwargs):
-        if len(args) >= 6:
+        if len(args) >= 9:
             (self.cfg_zero_enabled, self.zero_init_first_step, 
-             self.fdg_enabled, self.w_low, self.w_high, self.fdg_levels) = args[:6]
+             self.fdg_enabled, self.w_low, self.w_high, self.fdg_levels,
+             self.s2_guidance_enabled, self.s2_scale_omega, self.s2_drop_ratio) = args[:9]
         else:
-            logging.warning("CFG-Zero/FDG: Not enough arguments provided.")
+            logging.warning("Custom Guidance: Not enough arguments provided from UI.")
 
         # Xử lý XYZ Grid
-        xyz_settings = getattr(p, "_cfg_zero_xyz", {})
+        xyz_settings = getattr(p, "_custom_guidance_xyz", {})
         if "cfg_zero_enabled" in xyz_settings: self.cfg_zero_enabled = str(xyz_settings["cfg_zero_enabled"]).lower() == "true"
         if "zero_init" in xyz_settings: self.zero_init_first_step = str(xyz_settings["zero_init"]).lower() == "true"
         if "fdg_enabled" in xyz_settings: self.fdg_enabled = str(xyz_settings["fdg_enabled"]).lower() == "true"
         if "w_low" in xyz_settings: self.w_low = float(xyz_settings["w_low"])
         if "w_high" in xyz_settings: self.w_high = float(xyz_settings["w_high"])
         if "fdg_levels" in xyz_settings: self.fdg_levels = int(xyz_settings["fdg_levels"])
+        if "s2_enabled" in xyz_settings: self.s2_guidance_enabled = str(xyz_settings["s2_enabled"]).lower() == "true"
+        if "s2_omega" in xyz_settings: self.s2_scale_omega = float(xyz_settings["s2_omega"])
+        if "s2_drop" in xyz_settings: self.s2_drop_ratio = float(xyz_settings["s2_drop"])
 
-        # Khôi phục unet gốc trước khi patch
         if hasattr(p, '_original_unet_before_custom_guidance'):
             p.sd_model.forge_objects.unet = p._original_unet_before_custom_guidance.clone()
         else:
             p._original_unet_before_custom_guidance = p.sd_model.forge_objects.unet.clone()
 
-        # Dọn dẹp metadata trước
-        p.extra_generation_params.pop("CFG-Zero Enabled", None)
-        p.extra_generation_params.pop("CFG-Zero Init First Step", None)
-        p.extra_generation_params.pop("FDG Enabled", None)
-        p.extra_generation_params.pop("FDG w_low", None)
-        p.extra_generation_params.pop("FDG w_high", None)
-        p.extra_generation_params.pop("FDG Levels", None)
+        # Dọn dẹp metadata
+        params_to_pop = ["CFG-Zero Enabled", "CFG-Zero Init First Step", "FDG Enabled", "FDG w_low", "FDG w_high", "FDG Levels", "S2-Guidance Enabled", "S2-Guidance Omega", "S2-Guidance Drop Ratio"]
+        for param in params_to_pop:
+            p.extra_generation_params.pop(param, None)
         
-        # Nếu không có gì được bật, không patch và thoát
-        if not self.cfg_zero_enabled and not self.fdg_enabled:
-            logging.debug("CFG-Zero/FDG: Both disabled. No patch applied.")
+        if not self.cfg_zero_enabled and not self.fdg_enabled and not self.s2_guidance_enabled:
+            logging.debug("Custom Guidance: All methods disabled. No patch applied.")
             return
 
-        # Gọi hàm patch với tất cả các tham số
         patched_unet = self.node_instance.patch(
             p.sd_model.forge_objects.unet,
             cfg_zero_enabled=self.cfg_zero_enabled,
@@ -102,12 +111,15 @@ class CFGZeroScript(scripts.Script):
             fdg_enabled=self.fdg_enabled,
             w_low=self.w_low,
             w_high=self.w_high,
-            fdg_levels=int(self.fdg_levels)
+            fdg_levels=int(self.fdg_levels),
+            s2_guidance_enabled=self.s2_guidance_enabled,
+            s2_scale_omega=self.s2_scale_omega,
+            s2_drop_ratio=self.s2_drop_ratio
         )[0]
         
         p.sd_model.forge_objects.unet = patched_unet
 
-        # Cập nhật metadata nếu cần
+        # Cập nhật metadata
         if self.cfg_zero_enabled:
             p.extra_generation_params["CFG-Zero Enabled"] = self.cfg_zero_enabled
             p.extra_generation_params["CFG-Zero Init First Step"] = self.zero_init_first_step
@@ -116,15 +128,18 @@ class CFGZeroScript(scripts.Script):
             p.extra_generation_params["FDG w_low"] = self.w_low
             p.extra_generation_params["FDG w_high"] = self.w_high
             p.extra_generation_params["FDG Levels"] = int(self.fdg_levels)
+        if self.s2_guidance_enabled:
+            p.extra_generation_params["S2-Guidance Enabled"] = self.s2_guidance_enabled
+            p.extra_generation_params["S2-Guidance Omega"] = self.s2_scale_omega
+            p.extra_generation_params["S2-Guidance Drop Ratio"] = self.s2_drop_ratio
         
-        logging.debug(f"CFG-Zero/FDG: Patch applied. CFG-Zero: {self.cfg_zero_enabled}, FDG: {self.fdg_enabled}")
+        logging.debug(f"Custom Guidance: Patch applied. CFG-Zero: {self.cfg_zero_enabled}, FDG: {self.fdg_enabled}, S2-Guidance: {self.s2_guidance_enabled}")
         return
 
-# --- XYZ Grid Integration (Cần mở rộng) ---
 def custom_guidance_set_value(p, x: Any, xs: Any, *, field: str):
-    if not hasattr(p, "_cfg_zero_xyz"):
-        p._cfg_zero_xyz = {}
-    p._cfg_zero_xyz[field] = str(x)
+    if not hasattr(p, "_custom_guidance_xyz"):
+        p._custom_guidance_xyz = {}
+    p._custom_guidance_xyz[field] = str(x)
 
 def make_custom_guidance_axis_on_xyz_grid():
     xyz_grid = None
@@ -138,6 +153,9 @@ def make_custom_guidance_axis_on_xyz_grid():
         return
         
     options = [
+        xyz_grid.AxisOption(label="(CustomGuidance) S2 Enabled", type=str, apply=partial(custom_guidance_set_value, field="s2_enabled"), choices=lambda: ["True", "False"]),
+        xyz_grid.AxisOption(label="(CustomGuidance) S2 Omega", type=float, apply=partial(custom_guidance_set_value, field="s2_omega")),
+        xyz_grid.AxisOption(label="(CustomGuidance) S2 Drop Ratio", type=float, apply=partial(custom_guidance_set_value, field="s2_drop")),
         xyz_grid.AxisOption(label="(CustomGuidance) CFG-Zero Enabled", type=str, apply=partial(custom_guidance_set_value, field="cfg_zero_enabled"), choices=lambda: ["True", "False"]),
         xyz_grid.AxisOption(label="(CustomGuidance) Zero Init", type=str, apply=partial(custom_guidance_set_value, field="zero_init"), choices=lambda: ["True", "False"]),
         xyz_grid.AxisOption(label="(CustomGuidance) FDG Enabled", type=str, apply=partial(custom_guidance_set_value, field="fdg_enabled"), choices=lambda: ["True", "False"]),
@@ -146,7 +164,7 @@ def make_custom_guidance_axis_on_xyz_grid():
         xyz_grid.AxisOption(label="(CustomGuidance) FDG Levels", type=int, apply=partial(custom_guidance_set_value, field="fdg_levels")),
     ]
     xyz_grid.axis_options.extend(options)
-    logging.info("Custom Guidance (CFG-Zero/FDG): XYZ Grid options registered.")
+    logging.info("Custom Guidance: XYZ Grid options registered.")
 
 def on_custom_guidance_before_ui():
     try:
@@ -155,4 +173,4 @@ def on_custom_guidance_before_ui():
         print(f"[-] Custom Guidance Script: Error setting up XYZ Grid options:\n{traceback.format_exc()}", file=sys.stderr)
 
 script_callbacks.on_before_ui(on_custom_guidance_before_ui)
-# --- END OF FILE cfg_zero_script.py ---
+# --- END OF FILE cfg_zero_script (4).py ---
