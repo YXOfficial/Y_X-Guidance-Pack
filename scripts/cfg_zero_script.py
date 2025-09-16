@@ -113,39 +113,60 @@ class CFGZeroScript(scripts.Script):
         except Exception:
             pass
 
-# Compose Mahiro with the existing Y_X post‑CFG (single function for sampler_post_cfg_function)
-try:
-    mo = getattr(patched_unet, "model_options", {})
-except Exception:
-    mo = {}
-prev_post = None
-if isinstance(mo, dict):
-    prev_post = mo.get("sampler_post_cfg_function", None)
-
-if getattr(self, "mahiro_enabled", False):
-    import torch, torch.nn.functional as F
-    def _mahiro_wrap(args):
-        # Call previous post‑CFG (CFG‑Zero/FDG/S²) first
-        out = prev_post(args) if callable(prev_post) else args.get("denoised", None)
-        if out is None:
-            out = args.get("denoised", None)
-        # Mahiro gate
-        scale = float(args.get("cond_scale", 1.0))
-        C = args["cond_denoised"]
-        U = args["uncond_denoised"]
-        cfg = out
-        leap = C * scale
-        merge = 0.5 * (leap + cfg)
-        def srs(x): return torch.sqrt(x.abs() + 1e-12) * x.sign()
-        u_leap = U * scale
-        sim = F.cosine_similarity(srs(u_leap), srs(merge), dim=list(range(1, u_leap.ndim))).mean()
-        gate = 2.0 * (sim + 1.0)
-        return (gate * cfg + (4.0 - gate) * leap) / 4.0
-
-    # Replace the sampler_post_cfg_function with the composed one
+def process(self, p, *args):
     try:
-        from ldm_patched.modules.model_patcher import set_model_options_post_cfg_function
-        mo = set_model_options_post_cfg_function(mo, _mahiro_wrap, disable_cfg1_optimization=True)
-        patched_unet.set_model_options(mo)
-    except Exception:
-        pass
+        # get ModelPatcher UNet
+        unet = p.sd_model.forge_objects.unet if hasattr(p.sd_model, 'forge_objects') else p.sd_model
+
+        # apply original CFG-Zero/FDG/S² node patch
+        patched_unet, = CFGZeroNode().patch(
+            unet,
+            cfg_zero_enabled=getattr(self, "cfg_zero_enabled", False),
+            zero_init_first_step=getattr(self, "zero_init_first_step", False),
+            fdg_enabled=getattr(self, "fdg_enabled", False),
+            w_low=getattr(self, "w_low", 1.0),
+            w_high=getattr(self, "w_high", 1.0),
+            fdg_levels=getattr(self, "fdg_levels", 3),
+            s2_guidance_enabled=getattr(self, "s2_guidance_enabled", False),
+            s2_scale_omega=getattr(self, "s2_scale_omega", 0.25),
+            s2_drop_ratio=getattr(self, "s2_drop_ratio", 0.1),
+        )
+
+        # append Mahiro post‑CFG if enabled
+        if getattr(self, "mahiro_enabled", False):
+            import torch, torch.nn.functional as F
+            def _mahiro_post(args):
+                scale = float(args.get("cond_scale", 1.0))
+                C = args["cond_denoised"]
+                U = args["uncond_denoised"]
+                cfg = args["denoised"]
+                leap = C * scale
+                merge = 0.5 * (leap + cfg)
+                def srs(x): return torch.sqrt(x.abs() + 1e-12) * x.sign()
+                u_leap = U * scale
+                sim = F.cosine_similarity(srs(u_leap), srs(merge), dim=list(range(1, u_leap.ndim))).mean()
+                gate = 2.0 * (sim + 1.0)
+                return (gate * cfg + (4.0 - gate) * leap) / 4.0
+            try:
+                patched_unet.set_model_sampler_post_cfg_function(_mahiro_post, "mahiro_gate")
+            except Exception:
+                from ldm_patched.modules.model_patcher import set_model_options_post_cfg_function
+                mo = getattr(patched_unet, "model_options", {})
+                mo = set_model_options_post_cfg_function(mo, _mahiro_post, disable_cfg1_optimization=True)
+                patched_unet.set_model_options(mo)
+
+        # write back
+        if hasattr(p.sd_model, 'forge_objects'):
+            p.sd_model.forge_objects.unet = patched_unet
+        else:
+            p.sd_model = patched_unet
+
+        # metadata
+        if getattr(self, "mahiro_enabled", False):
+            p.extra_generation_params["Mahiro Enabled"] = True
+        p.extra_generation_params["CFG-Zero Enabled"] = bool(getattr(self, "cfg_zero_enabled", False))
+        p.extra_generation_params["FDG Enabled"] = bool(getattr(self, "fdg_enabled", False))
+        p.extra_generation_params["S2-Guidance Enabled"] = bool(getattr(self, "s2_guidance_enabled", False))
+
+    except Exception as e:
+        logging.exception(f"[CFG-Zero Script] process() failed: {e}")
