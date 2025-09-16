@@ -34,7 +34,7 @@ class CFGZeroNode:
     CATEGORY = "advanced/model_patches"
     DESCRIPTION = "Applies CFG-Zero, FDG, and/or S2-Guidance scaling."
 
-    def patch(self, model, cfg_zero_enabled: bool = False, zero_init_first_step: bool = False,
+    def patch(self, model, mahiro_enabled: bool = False, cfg_zero_enabled: bool = False, zero_init_first_step: bool = False,
               fdg_enabled: bool = False, w_low: float = 1.0, w_high: float = 1.0, fdg_levels: int = 3,
               s2_guidance_enabled: bool = False, s2_scale_omega: float = 0.25, s2_drop_ratio: float = 0.1):
 
@@ -142,21 +142,78 @@ class CFGZeroNode:
                 # lấy item cond đầu tiên (đủ cho S² branch)
                 if not (isinstance(cond_list, list) and len(cond_list) > 0 and isinstance(cond_list[0], dict)):
                     logging.warning("S2-Guidance: unexpected cond format; skip S2 this step.")
-                    return combined_pred
+        
+            # --- Mahiro gating (optional) -------------------------------------
+            if mahiro_enabled:
+                scale = cond_scale
+                C = cond_denoised
+                U = uncond_denoised
+                leap = C * scale
+                # blend our improved guidance (combined_pred) with pure-cond leap
+                merge = 0.5 * (leap + combined_pred)
+
+                def srs(x: torch.Tensor):
+                    return torch.sqrt(x.abs() + 1e-12) * x.sign()
+
+                u_leap = U * scale
+                # cosine similarity along channel/spatial dims; average across batch
+                sim = torch.nn.functional.cosine_similarity(srs(u_leap), srs(merge), dim=list(range(1, U.ndim))).mean()
+                simsc = 2.0 * (sim + 1.0)  # [0,4]
+                combined_pred = (simsc * combined_pred + (4.0 - simsc) * leap) / 4.0
+
+            return combined_pred
                 h0 = cond_list[0]
 
                 # cross-attn THẬT (tensor), không dùng wrapper
                 c_crossattn_tensor = h0.get("cross_attn", None)
                 if c_crossattn_tensor is None:
                     logging.warning("S2-Guidance: cross_attn tensor not found; skip S2 this step.")
-                    return combined_pred
+        
+            # --- Mahiro gating (optional) -------------------------------------
+            if mahiro_enabled:
+                scale = cond_scale
+                C = cond_denoised
+                U = uncond_denoised
+                leap = C * scale
+                # blend our improved guidance (combined_pred) with pure-cond leap
+                merge = 0.5 * (leap + combined_pred)
+
+                def srs(x: torch.Tensor):
+                    return torch.sqrt(x.abs() + 1e-12) * x.sign()
+
+                u_leap = U * scale
+                # cosine similarity along channel/spatial dims; average across batch
+                sim = torch.nn.functional.cosine_similarity(srs(u_leap), srs(merge), dim=list(range(1, U.ndim))).mean()
+                simsc = 2.0 * (sim + 1.0)  # [0,4]
+                combined_pred = (simsc * combined_pred + (4.0 - simsc) * leap) / 4.0
+
+            return combined_pred
 
                 # nếu UNet là class-conditional thì bắt buộc có y
                 needs_y = getattr(m.model.diffusion_model, "num_classes", None) is not None
                 y_tensor = h0.get("pooled_output", None) if needs_y else None
                 if needs_y and y_tensor is None:
                     logging.warning("S2-Guidance: model needs 'y' but pooled_output not found; skip S2 this step.")
-                    return combined_pred
+        
+            # --- Mahiro gating (optional) -------------------------------------
+            if mahiro_enabled:
+                scale = cond_scale
+                C = cond_denoised
+                U = uncond_denoised
+                leap = C * scale
+                # blend our improved guidance (combined_pred) with pure-cond leap
+                merge = 0.5 * (leap + combined_pred)
+
+                def srs(x: torch.Tensor):
+                    return torch.sqrt(x.abs() + 1e-12) * x.sign()
+
+                u_leap = U * scale
+                # cosine similarity along channel/spatial dims; average across batch
+                sim = torch.nn.functional.cosine_similarity(srs(u_leap), srs(merge), dim=list(range(1, U.ndim))).mean()
+                simsc = 2.0 * (sim + 1.0)  # [0,4]
+                combined_pred = (simsc * combined_pred + (4.0 - simsc) * leap) / 4.0
+
+            return combined_pred
 
                 # c_concat (nếu có) nằm trong model_conds dưới dạng wrapper CONDRegular
                 c_concat = None
@@ -183,6 +240,25 @@ class CFGZeroNode:
 
                 denoised_s = get_prediction_with_dropped_blocks(m.model.apply_model, model_kwargs)
                 combined_pred = combined_pred - s2_scale_omega * denoised_s
+
+
+            # --- Mahiro gating (optional) -------------------------------------
+            if mahiro_enabled:
+                scale = cond_scale
+                C = cond_denoised
+                U = uncond_denoised
+                leap = C * scale
+                # blend our improved guidance (combined_pred) with pure-cond leap
+                merge = 0.5 * (leap + combined_pred)
+
+                def srs(x: torch.Tensor):
+                    return torch.sqrt(x.abs() + 1e-12) * x.sign()
+
+                u_leap = U * scale
+                # cosine similarity along channel/spatial dims; average across batch
+                sim = torch.nn.functional.cosine_similarity(srs(u_leap), srs(merge), dim=list(range(1, U.ndim))).mean()
+                simsc = 2.0 * (sim + 1.0)  # [0,4]
+                combined_pred = (simsc * combined_pred + (4.0 - simsc) * leap) / 4.0
 
             return combined_pred
 
