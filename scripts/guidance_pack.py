@@ -47,10 +47,10 @@ class GuidancePackScript(scripts.Script):
 
     def process(self, p, *args):
         # Patch model just before sampling
-        m = p.sd_model
+        m_unet = p.sd_model.forge_objects.unet
         # Apply unified node: Mahiro flag is handled inside nodes_cfg_zero
         node = CFGZeroNode()
-        patched, = node.patch(m, mahiro_enabled=self.state.get("mahiro", False),
+        patched, = node.patch(m_unet, mahiro_enabled=self.state.get("mahiro", False),
                               cfg_zero_enabled=self.state.get("cfg_zero", False),
                               zero_init_first_step=self.state.get("zero_init", False),
                               fdg_enabled=self.state.get("fdg", False),
@@ -60,7 +60,7 @@ class GuidancePackScript(scripts.Script):
                               s2_guidance_enabled=self.state.get("s2", False),
                               s2_scale_omega=self.state.get("s2w", 0.25),
                               s2_drop_ratio=self.state.get("s2drop", 0.1))
-        p.sd_model = patched
+        p.sd_model.forge_objects.unet = patched
         p.extra_generation_params.update({
             "guidance_pack_mahiro": self.state.get("mahiro", False),
             "guidance_pack_cfg_zero": self.state.get("cfg_zero", False),
