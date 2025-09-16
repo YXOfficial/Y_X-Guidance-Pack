@@ -76,20 +76,19 @@ class YX_Mahiro_Addon_Script(scripts.Script):
                 out = (gate * cfg_now + (4.0 - gate) * leap) / 4.0
                 return out
 
-            # Chain our wrapper as the new sampler_post_cfg_function
-            if set_model_options_post_cfg_function is not None:
-                mo = set_model_options_post_cfg_function(mo, _mahiro_gate, disable_cfg1_optimization=True)
-                mo["_mahiro_addon_chained"] = True
-                unet.set_model_options(mo)
-            else:
-                # Fallback: try direct attribute (older forks)
-                mo["sampler_post_cfg_function"] = _mahiro_gate
-                mo["_mahiro_addon_chained"] = True
-                try:
-                    unet.set_model_options(mo)
-                except Exception as e:
-                    logging.error(f"[Mahiro Add‑on] Failed to set model_options: {e}")
-
-            logging.info("[Mahiro Add‑on] Chained after Y_X post‑CFG successfully.")
-        except Exception as e:
-            logging.exception(f"[Mahiro Add‑on] process() failed: {e}")
+            
+# Chain our wrapper as the new sampler_post_cfg_function (no rewrite of Y_X files)
+            try:
+                # 1) Prefer in-place update of model_options dict (used by k-diff samplers)
+                mo_dict = getattr(unet, "model_options", None)
+                if isinstance(mo_dict, dict):
+                    mo_dict["sampler_post_cfg_function"] = _mahiro_gate
+                    mo_dict["_mahiro_addon_chained"] = True
+                # 2) Also set the attribute-level hook (used by some forks)
+                if hasattr(unet, "set_model_sampler_post_cfg_function"):
+                    unet.set_model_sampler_post_cfg_function(_mahiro_gate, "mahiro_addon_chain")
+                else:
+                    setattr(unet, "sampler_post_cfg_function", _mahiro_gate)
+                logging.info("[Mahiro Add‑on] Chained post‑CFG via dict+attr successfully.")
+            except Exception as e:
+                logging.exception(f"[Mahiro Add‑on] Failed to chain post‑CFG: {e}")
