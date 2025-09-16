@@ -3,6 +3,7 @@ import logging
 import gradio as gr
 from modules import scripts
 from guidance_pack.cfgzero.nodes_cfg_zero import CFGZeroNode
+from guidance_pack.mahiro.append_mahiro import AppendMahiroPostCFG
 from guidance_pack.mahiro.nodes_mahiro import MahiroPack
 
 class GuidancePackScript(scripts.Script):
@@ -48,19 +49,21 @@ class GuidancePackScript(scripts.Script):
     def process(self, p, *args):
         # Patch model just before sampling
         m_unet = p.sd_model.forge_objects.unet
-        # Apply unified node: Mahiro flag is handled inside nodes_cfg_zero
-        node = CFGZeroNode()
-        patched, = node.patch(m_unet, mahiro_enabled=self.state.get("mahiro", False),
-                              cfg_zero_enabled=self.state.get("cfg_zero", False),
-                              zero_init_first_step=self.state.get("zero_init", False),
-                              fdg_enabled=self.state.get("fdg", False),
-                              w_low=self.state.get("w_low", 1.0),
-                              w_high=self.state.get("w_high", 1.0),
-                              fdg_levels=int(self.state.get("pyr", 3)),
-                              s2_guidance_enabled=self.state.get("s2", False),
-                              s2_scale_omega=self.state.get("s2w", 0.25),
-                              s2_drop_ratio=self.state.get("s2drop", 0.1))
-        p.sd_model.forge_objects.unet = patched
+patched, = node.patch(m_unet,
+    cfg_zero_enabled=self.state.get('cfg_zero', False),
+    zero_init_first_step=self.state.get('zero_init', False),
+    fdg_enabled=self.state.get('fdg', False),
+    w_low=self.state.get('w_low', 1.0),
+    w_high=self.state.get('w_high', 1.0),
+    fdg_levels=int(self.state.get('pyr', 3)),
+    s2_guidance_enabled=self.state.get('s2', False),
+    s2_scale_omega=self.state.get('s2w', 0.25),
+    s2_drop_ratio=self.state.get('s2drop', 0.1)
+)
+# Optional: append Mahiro gating as a second post‑CFG
+if self.state.get('mahiro', False):
+    patched, = AppendMahiroPostCFG().patch(patched, enabled=True)
+p.sd_model.forge_objects.unet = patched
         p.extra_generation_params.update({
             "guidance_pack_mahiro": self.state.get("mahiro", False),
             "guidance_pack_cfg_zero": self.state.get("cfg_zero", False),
