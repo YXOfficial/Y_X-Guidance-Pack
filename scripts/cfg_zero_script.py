@@ -123,28 +123,28 @@ class CFGZeroScript(scripts.Script):
         
 
 # Optional: append Mahiro gating as a second post‑CFG
-if getattr(self, "mahiro_enabled", False):
-    import torch, torch.nn.functional as F
-    def _mahiro_post(args):
-        scale = float(args.get("cond_scale", 1.0))
-        C = args["cond_denoised"]
-        U = args["uncond_denoised"]
-        cfg = args["denoised"]  # current CFG/FDG/S² result
-        leap = C * scale
-        merge = 0.5 * (leap + cfg)
-        def srs(x): return torch.sqrt(x.abs() + 1e-12) * x.sign()
-        u_leap = U * scale
-        sim = F.cosine_similarity(srs(u_leap), srs(merge), dim=list(range(1, u_leap.ndim))).mean()
-        gate = 2.0 * (sim + 1.0)  # [0,4]
-        return (gate * cfg + (4.0 - gate) * leap) / 4.0
-    try:
-        patched_unet.set_model_sampler_post_cfg_function(_mahiro_post, "mahiro_gate")
-    except Exception:
-        from ldm_patched.modules.model_patcher import set_model_options_post_cfg_function
-        mo = getattr(patched_unet, "model_options", {})
-        mo = set_model_options_post_cfg_function(mo, _mahiro_post, disable_cfg1_optimization=True)
-        patched_unet.set_model_options(mo)
-
+        # Optional: append Mahiro gating as a second post‑CFG
+        if getattr(self, "mahiro_enabled", False):
+            import torch, torch.nn.functional as F
+            def _mahiro_post(args):
+                scale = float(args.get("cond_scale", 1.0))
+                C = args["cond_denoised"]
+                U = args["uncond_denoised"]
+                cfg = args["denoised"]  # current CFG/FDG/S² result
+                leap = C * scale
+                merge = 0.5 * (leap + cfg)
+                def srs(x): return torch.sqrt(x.abs() + 1e-12) * x.sign()
+                u_leap = U * scale
+                sim = F.cosine_similarity(srs(u_leap), srs(merge), dim=list(range(1, u_leap.ndim))).mean()
+                gate = 2.0 * (sim + 1.0)  # [0,4]
+                return (gate * cfg + (4.0 - gate) * leap) / 4.0
+            try:
+                patched_unet.set_model_sampler_post_cfg_function(_mahiro_post, "mahiro_gate")
+            except Exception:
+                from ldm_patched.modules.model_patcher import set_model_options_post_cfg_function
+                mo = getattr(patched_unet, "model_options", {})
+                mo = set_model_options_post_cfg_function(mo, _mahiro_post, disable_cfg1_optimization=True)
+                patched_unet.set_model_options(mo)
         p.sd_model.forge_objects.unet = patched_unet
 
         # Cập nhật metadata
