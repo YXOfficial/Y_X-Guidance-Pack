@@ -112,3 +112,40 @@ class CFGZeroScript(scripts.Script):
             # original script resets and patches inside process(); we keep compatibility here
         except Exception:
             pass
+
+# Compose Mahiro with the existing Y_X post‑CFG (single function for sampler_post_cfg_function)
+try:
+    mo = getattr(patched_unet, "model_options", {})
+except Exception:
+    mo = {}
+prev_post = None
+if isinstance(mo, dict):
+    prev_post = mo.get("sampler_post_cfg_function", None)
+
+if getattr(self, "mahiro_enabled", False):
+    import torch, torch.nn.functional as F
+    def _mahiro_wrap(args):
+        # Call previous post‑CFG (CFG‑Zero/FDG/S²) first
+        out = prev_post(args) if callable(prev_post) else args.get("denoised", None)
+        if out is None:
+            out = args.get("denoised", None)
+        # Mahiro gate
+        scale = float(args.get("cond_scale", 1.0))
+        C = args["cond_denoised"]
+        U = args["uncond_denoised"]
+        cfg = out
+        leap = C * scale
+        merge = 0.5 * (leap + cfg)
+        def srs(x): return torch.sqrt(x.abs() + 1e-12) * x.sign()
+        u_leap = U * scale
+        sim = F.cosine_similarity(srs(u_leap), srs(merge), dim=list(range(1, u_leap.ndim))).mean()
+        gate = 2.0 * (sim + 1.0)
+        return (gate * cfg + (4.0 - gate) * leap) / 4.0
+
+    # Replace the sampler_post_cfg_function with the composed one
+    try:
+        from ldm_patched.modules.model_patcher import set_model_options_post_cfg_function
+        mo = set_model_options_post_cfg_function(mo, _mahiro_wrap, disable_cfg1_optimization=True)
+        patched_unet.set_model_options(mo)
+    except Exception:
+        pass
