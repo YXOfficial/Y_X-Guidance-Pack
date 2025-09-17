@@ -2,26 +2,24 @@ import logging
 import gradio as gr
 from modules import scripts
 
-try:
-    # Forge/Test‑ReForge runtime
-    from ldm_patched.modules.model_patcher import set_model_options_post_cfg_function
-except Exception:
-    set_model_options_post_cfg_function = None
-
 class YX_Mahiro_Addon_Script(scripts.Script):
-    """Add‑only Mahiro gating that chains AFTER the original Y_X post‑CFG.
-    It does not modify or replace Y_X files; it just wraps the existing post‑CFG.
+    """
+    Add-only Mahiro gating that chains AFTER the original Y_X post-CFG.
+    Does not modify or replace Y_X files; it only wraps the existing post-CFG.
     """
 
-    sorting_priority = 16.0  # run after Y_X script (which is usually ~15)
+    sorting_priority = 16.0  # run after Y_X script (usually ~15)
 
-    def title(self): return "Y_X Add‑on: Mahiro (chain post‑CFG)"
-    def show(self, is_img2img): return scripts.AlwaysVisible
+    def title(self):
+        return "Y_X Add-on: Mahiro (chain post-CFG)"
+
+    def show(self, is_img2img):
+        return scripts.AlwaysVisible
 
     def ui(self, *args, **kwargs):
         with gr.Accordion(open=False, label=self.title()):
-            en = gr.Checkbox(label="Enable Mahiro add‑on (chain after Y_X)", value=False)
-        # return one arg; we won't touch Y_X UI
+            en = gr.Checkbox(label="Enable Mahiro add-on (chain after Y_X)", value=False)
+        # Return ONE arg; we do not touch the Y_X UI
         return [en]
 
     def process_before_every_sampling(self, p, enabled=False, **kwargs):
@@ -29,16 +27,34 @@ class YX_Mahiro_Addon_Script(scripts.Script):
 
     def process(self, p, enabled=False, *args, **kwargs):
         try:
-            if not self.enabled:
+            if not getattr(self, "enabled", False):
                 return
 
-            # Get the UNet (ModelPatcher) from Forge/Test‑ReForge
-            unet = getattr(getattr(p.sd_model, "forge_objects", p.sd_model), "unet", p.sd_model)
+            # Get UNet (ModelPatcher) from Forge/Test-ReForge
+            unet = None
+            try:
+                if hasattr(p.sd_model, "forge_objects") and hasattr(p.sd_model.forge_objects, "unet"):
+                    unet = p.sd_model.forge_objects.unet
+                else:
+                    unet = p.sd_model
+            except Exception:
+                unet = getattr(p, "sd_model", None)
 
-            # Access current model_options (do NOT overwrite; we only wrap)
-            mo = getattr(unet, "model_options", {}) or {}
+            if unet is None:
+                logging.warning("[Mahiro Add-on] UNet not found; skipping.")
+                return
 
-            # Prevent double‑append across runs
+            # Access current model_options (do NOT overwrite; mutate in place)
+            mo = getattr(unet, "model_options", None)
+            if not isinstance(mo, dict):
+                # Create dict if missing
+                mo = {}
+                try:
+                    setattr(unet, "model_options", mo)
+                except Exception:
+                    pass
+
+            # Prevent double-append across runs
             if mo.get("_mahiro_addon_chained", False):
                 return
 
@@ -48,17 +64,17 @@ class YX_Mahiro_Addon_Script(scripts.Script):
             import torch.nn.functional as F
 
             def _mahiro_gate(args):
-                # 1) run original Y_X post‑CFG first (if any)
+                # 1) run original Y_X post-CFG first (if any)
                 den = args.get("denoised", None)
                 if callable(prev_post):
                     try:
                         den = prev_post(args)
-                    except Exception as e:
-                        logging.warning(f"[Mahiro Add‑on] prev_post failed, falling back to args['denoised']: {e}")
+                    except Exception as e_prev:
+                        logging.warning(f"[Mahiro Add-on] prev_post failed, using args['denoised']: {e_prev}")
                 if den is None:
                     den = args["denoised"]
 
-                # 2) Mahiro gating on top of the previous result
+                # 2) Mahiro gating on top of previous result
                 scale = float(args.get("cond_scale", 1.0))
                 C = args["cond_denoised"]
                 U = args["uncond_denoised"]
@@ -67,28 +83,35 @@ class YX_Mahiro_Addon_Script(scripts.Script):
                 leap = C * scale
                 merge = 0.5 * (leap + cfg_now)
 
-                # signed sqrt normalize; cosine along channel, then mean over HxW
-                def srs(x): return torch.sqrt(x.abs() + 1e-12) * x.sign()
-                sim_map = F.cosine_similarity(srs(U * scale), srs(merge), dim=1)  # (B,H,W)
-                sim = sim_map.mean()  # scalar
+                def srs(x):
+                    return torch.sqrt(x.abs() + 1e-12) * x.sign()
 
+                u_leap = U * scale
+                # cosine over channel dim; mean over H,W
+                sim_map = F.cosine_similarity(srs(u_leap), srs(merge), dim=1)  # (B,H,W)
+                sim = sim_map.mean()
                 gate = 2.0 * (sim + 1.0)  # [0,4]
                 out = (gate * cfg_now + (4.0 - gate) * leap) / 4.0
                 return out
 
-            
-# Chain our wrapper as the new sampler_post_cfg_function (no rewrite of Y_X files)
+            # Chain our wrapper as the new sampler_post_cfg_function (add-only)
             try:
-                # 1) Prefer in-place update of model_options dict (used by k-diff samplers)
-                mo_dict = getattr(unet, "model_options", None)
-                if isinstance(mo_dict, dict):
-                    mo_dict["sampler_post_cfg_function"] = _mahiro_gate
-                    mo_dict["_mahiro_addon_chained"] = True
-                # 2) Also set the attribute-level hook (used by some forks)
+                # 1) In-place update of model_options dict (used by k-diff samplers)
+                mo["sampler_post_cfg_function"] = _mahiro_gate
+                mo["_mahiro_addon_chained"] = True
+            except Exception as e_mo:
+                logging.warning(f"[Mahiro Add-on] Could not mutate model_options dict: {e_mo}")
+
+            try:
+                # 2) Also set attribute-level hook (used by some forks)
                 if hasattr(unet, "set_model_sampler_post_cfg_function"):
                     unet.set_model_sampler_post_cfg_function(_mahiro_gate, "mahiro_addon_chain")
                 else:
                     setattr(unet, "sampler_post_cfg_function", _mahiro_gate)
-                logging.info("[Mahiro Add‑on] Chained post‑CFG via dict+attr successfully.")
-            except Exception as e:
-                logging.exception(f"[Mahiro Add‑on] Failed to chain post‑CFG: {e}")
+            except Exception as e_attr:
+                logging.warning(f"[Mahiro Add-on] Could not set model-level post-CFG: {e_attr}")
+
+            logging.info("[Mahiro Add-on] Chained post-CFG via dict+attr successfully.")
+
+        except Exception as e:
+            logging.exception(f"[Mahiro Add-on] process() failed: {e}")
