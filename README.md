@@ -4,8 +4,11 @@
 
 # Comfyui (Wait for support)
 
+## Guidance Bundle Node
+- `YX-Guidance Bundle` gộp CFG-Zero, FDG, S² và ZeResFDG vào cùng một node để bật/tắt và tinh chỉnh trong một chỗ thay vì kéo bốn node riêng lẻ.
+
 # To do
-- [x] [ZeResFDG](https://arxiv.org/pdf/2510.12954) 
+- [x] [ZeResFDG](https://arxiv.org/pdf/2510.12954)
 - [x] [CFG Zero](https://arxiv.org/abs/2503.18886)
 - [x] [FDG](https://arxiv.org/pdf/2506.19713)
 # [sd-perturbed-attention-shit](https://github.com/YXOfficial/sd-perturbed-attention-shit)
