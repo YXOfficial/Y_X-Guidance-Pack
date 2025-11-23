@@ -219,15 +219,37 @@ def make_s2_modifier(model, s2_drop_ratio: float, s2_scale_omega: float) -> Call
     return modifier
 
 
-def reset_unet_if_needed(p):
+GUIDANCE_PARAM_KEYS = [
+    "CFG-Zero Enabled",
+    "CFG-Zero Init First Step",
+    "FDG Enabled",
+    "FDG w_low",
+    "FDG w_high",
+    "FDG Levels",
+    "S2-Guidance Enabled",
+    "S2-Guidance Omega",
+    "S2-Guidance Drop Ratio",
+]
+
+
+def reset_unet_if_needed(p) -> bool:
     if not hasattr(p, "_guidance_original_unet"):
         p._guidance_original_unet = p.sd_model.forge_objects.unet.clone()
     if getattr(p, "_guidance_unet_restored", False):
-        return
+        return False
     p.sd_model.forge_objects.unet = p._guidance_original_unet.clone()
     p._guidance_unet_restored = True
+    return True
 
 
 def clear_generation_params(p, keys):
     for param in keys:
         p.extra_generation_params.pop(param, None)
+
+
+def clear_generation_params_once(p, keys=GUIDANCE_PARAM_KEYS):
+    if getattr(p, "_guidance_params_cleared", False):
+        return False
+    clear_generation_params(p, keys)
+    p._guidance_params_cleared = True
+    return True

@@ -6,7 +6,7 @@ from functools import partial
 import gradio as gr
 from modules import scripts, script_callbacks
 
-from guidance_utils import clear_generation_params, reset_unet_if_needed
+from guidance_utils import clear_generation_params_once, reset_unet_if_needed
 from nodes_s2_guidance import S2GuidanceNode
 
 
@@ -59,8 +59,9 @@ class S2GuidanceScript(scripts.Script):
         if "s2_drop" in xyz_settings:
             self.s2_drop_ratio = float(xyz_settings["s2_drop"])
 
-        reset_unet_if_needed(p)
-        clear_generation_params(p, ["S2-Guidance Enabled", "S2-Guidance Omega", "S2-Guidance Drop Ratio"])
+        restored = reset_unet_if_needed(p)
+        if restored:
+            clear_generation_params_once(p)
 
         if not self.s2_guidance_enabled:
             logging.debug("S2-Guidance: disabled. No patch applied.")

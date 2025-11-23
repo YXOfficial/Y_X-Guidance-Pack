@@ -6,7 +6,7 @@ from functools import partial
 import gradio as gr
 from modules import scripts, script_callbacks
 
-from guidance_utils import clear_generation_params, reset_unet_if_needed
+from guidance_utils import clear_generation_params_once, reset_unet_if_needed
 from nodes_cfg_zero import CFGZeroNode
 
 
@@ -53,8 +53,9 @@ class CFGZeroScript(scripts.Script):
         if "zero_init" in xyz_settings:
             self.zero_init_first_step = str(xyz_settings["zero_init"]).lower() == "true"
 
-        reset_unet_if_needed(p)
-        clear_generation_params(p, ["CFG-Zero Enabled", "CFG-Zero Init First Step"])
+        restored = reset_unet_if_needed(p)
+        if restored:
+            clear_generation_params_once(p)
 
         if not self.cfg_zero_enabled:
             logging.debug("CFG-Zero: disabled. No patch applied.")

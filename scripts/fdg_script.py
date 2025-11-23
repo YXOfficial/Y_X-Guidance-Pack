@@ -6,7 +6,7 @@ from functools import partial
 import gradio as gr
 from modules import scripts, script_callbacks
 
-from guidance_utils import clear_generation_params, reset_unet_if_needed
+from guidance_utils import clear_generation_params_once, reset_unet_if_needed
 from nodes_fdg import FDGNode
 
 
@@ -63,8 +63,9 @@ class FDGScript(scripts.Script):
         if "fdg_levels" in xyz_settings:
             self.fdg_levels = int(xyz_settings["fdg_levels"])
 
-        reset_unet_if_needed(p)
-        clear_generation_params(p, ["FDG Enabled", "FDG w_low", "FDG w_high", "FDG Levels"])
+        restored = reset_unet_if_needed(p)
+        if restored:
+            clear_generation_params_once(p)
 
         if not self.fdg_enabled:
             logging.debug("FDG: disabled. No patch applied.")
