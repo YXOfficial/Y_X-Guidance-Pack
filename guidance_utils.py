@@ -3,6 +3,8 @@ import random
 from typing import Callable, Dict
 
 import torch
+import torch.nn.functional as F
+from kornia.filters import gaussian_blur2d
 from kornia.geometry.transform import build_laplacian_pyramid
 
 
@@ -86,6 +88,28 @@ def make_cfg_zero_base_builder(zero_init_first_step: bool, initial_sigma: float)
     return builder
 
 
+def make_zeresfdg_base_builder() -> Callable:
+    def builder(args) -> GuidanceState:
+        cond_scale = args["cond_scale"]
+        cond_denoised = args["cond_denoised"]
+        uncond_denoised = args["uncond_denoised"]
+
+        original_shape = cond_denoised.shape
+        batch_size = original_shape[0] if len(original_shape) > 0 else 1
+        positive_flat = cond_denoised.reshape(batch_size, -1)
+        negative_flat = uncond_denoised.reshape(batch_size, -1)
+        dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
+        squared_norm_negative = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
+        alpha_parallel = dot_product / squared_norm_negative
+        alpha_parallel = alpha_parallel.view(batch_size, *([1] * (len(original_shape) - 1)))
+        base_pred = uncond_denoised * alpha_parallel
+        residual = cond_denoised - base_pred
+        guidance_term = residual * cond_scale
+        return GuidanceState(base_pred, guidance_term)
+
+    return builder
+
+
 def make_fdg_modifier(w_low: float, w_high: float, fdg_levels: int) -> Callable:
     def modifier(args, state: GuidanceState) -> GuidanceState:
         cond_scale = args["cond_scale"]
@@ -123,6 +147,135 @@ def make_fdg_modifier(w_low: float, w_high: float, fdg_levels: int) -> Callable:
             final_guidance_term = state.guidance_term
 
         return GuidanceState(state.base_prediction, final_guidance_term)
+
+    return modifier
+
+
+def make_zeresfdg_modifier(
+    w_low: float,
+    w_high: float,
+    alpha: float,
+    tau_lo: float,
+    tau_hi: float,
+    beta: float,
+    controller_enabled: bool,
+    sigma: float = 1.0,
+):
+    eps = 1e-8
+    rho = None
+    mode_state = None
+
+    def gaussian_lowpass(tensor: torch.Tensor) -> torch.Tensor:
+        if tensor.dim() != 4:
+            return tensor
+        kernel_size = int(max(3, 2 * round(3 * sigma) + 1))
+        if kernel_size % 2 == 0:
+            kernel_size += 1
+        try:
+            return gaussian_blur2d(
+                tensor,
+                kernel_size=(kernel_size, kernel_size),
+                sigma=(sigma, sigma),
+                border_type="reflect",
+            )
+        except Exception as e:
+            logging.error(f"ZeResFDG: Gaussian blur failed with error {e}; skipping blur.")
+            return tensor
+
+    def ensure_mask(mask, target: torch.Tensor) -> torch.Tensor:
+        if mask is None:
+            return None
+        if not torch.is_tensor(mask):
+            mask = torch.tensor(mask, device=target.device, dtype=target.dtype)
+        else:
+            mask = mask.to(device=target.device, dtype=target.dtype)
+
+        if mask.dim() == 2:
+            mask = mask.unsqueeze(0).unsqueeze(0)
+        elif mask.dim() == 3:
+            mask = mask.unsqueeze(1)
+
+        if mask.shape[0] == 1 and target.shape[0] > 1:
+            mask = mask.expand(target.shape[0], *mask.shape[1:])
+
+        if mask.shape[-2:] != target.shape[-2:]:
+            mask = F.interpolate(mask, size=target.shape[-2:], mode="bilinear", align_corners=False)
+
+        if mask.shape[1] == 1 and target.shape[1] > 1:
+            mask = mask.expand(target.shape[0], target.shape[1], *mask.shape[-2:])
+
+        return mask
+
+    def apply_mask(tensor: torch.Tensor, mask) -> torch.Tensor:
+        mask_tensor = ensure_mask(mask, tensor)
+        if mask_tensor is None:
+            return tensor
+        return tensor * mask_tensor
+
+    def update_mode(ratio: torch.Tensor):
+        nonlocal mode_state
+        if not controller_enabled:
+            mode_state = torch.ones_like(ratio, dtype=torch.bool)
+            return mode_state
+
+        if mode_state is None or mode_state.shape != ratio.shape:
+            mode_state = ratio > tau_hi
+        mode_state = torch.where(ratio > tau_hi, torch.ones_like(mode_state, dtype=torch.bool), mode_state)
+        mode_state = torch.where(ratio < tau_lo, torch.zeros_like(mode_state, dtype=torch.bool), mode_state)
+        return mode_state
+
+    def modifier(args, state: GuidanceState) -> GuidanceState:
+        nonlocal rho
+        cond_scale = args["cond_scale"]
+        cond_denoised = args["cond_denoised"]
+        uncond_denoised = args["uncond_denoised"]
+        guidance_mask = args.get("guidance_mask") or args.get("mask") or args.get("g")
+
+        if cond_scale != 0:
+            residual = state.guidance_term / cond_scale
+        else:
+            residual = state.guidance_term
+
+        delta = cond_denoised - uncond_denoised
+        delta_low = gaussian_lowpass(delta)
+        delta_high = delta - delta_low
+
+        batch_size = delta.shape[0]
+        low_norm = torch.sum(delta_low.reshape(batch_size, -1) ** 2, dim=1)
+        high_norm = torch.sum(delta_high.reshape(batch_size, -1) ** 2, dim=1)
+        r_hf = high_norm / (low_norm + high_norm + eps)
+
+        if rho is None or rho.shape != r_hf.shape:
+            rho = r_hf.detach()
+        else:
+            rho = beta * rho + (1 - beta) * r_hf.detach()
+
+        mode = update_mode(rho)
+
+        residual_low = gaussian_lowpass(residual)
+        residual_high = residual - residual_low
+        fdg_residual = w_low * residual_low + w_high * residual_high
+        fdg_residual = apply_mask(fdg_residual, guidance_mask)
+        conservative_term = fdg_residual * cond_scale
+
+        fdg_delta = w_low * delta_low + w_high * delta_high
+        fdg_delta = apply_mask(fdg_delta, guidance_mask)
+        y_cfg = uncond_denoised + cond_scale * fdg_delta
+
+        dims = tuple(range(1, cond_denoised.dim()))
+        target_std = cond_denoised.std(dim=dims, keepdim=True)
+        y_cfg_std = y_cfg.std(dim=dims, keepdim=True)
+        rescale_factor = torch.where(y_cfg_std > 0, target_std / (y_cfg_std + eps), torch.ones_like(target_std))
+        y_rescaled = y_cfg * rescale_factor
+        rescaled_prediction = alpha * y_rescaled + (1 - alpha) * y_cfg
+        rescale_term = rescaled_prediction - state.base_prediction
+
+        if mode.dtype != torch.bool:
+            mode = mode > 0
+        mode = mode.view(batch_size, *([1] * (rescale_term.dim() - 1)))
+        combined_guidance = rescale_term * mode + conservative_term * (~mode)
+
+        return GuidanceState(state.base_prediction, combined_guidance)
 
     return modifier
 
@@ -226,6 +379,14 @@ GUIDANCE_PARAM_KEYS = [
     "FDG w_low",
     "FDG w_high",
     "FDG Levels",
+    "ZeResFDG Enabled",
+    "ZeResFDG λ_l",
+    "ZeResFDG λ_h",
+    "ZeResFDG α",
+    "ZeResFDG τ_lo",
+    "ZeResFDG τ_hi",
+    "ZeResFDG β",
+    "ZeResFDG Controller",
     "S2-Guidance Enabled",
     "S2-Guidance Omega",
     "S2-Guidance Drop Ratio",
