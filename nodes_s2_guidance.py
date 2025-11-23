@@ -25,6 +25,13 @@ class S2GuidanceNode:
             return (model,)
 
         patched_model = model.clone()
+
+        if hasattr(model, "_guidance_pipeline"):
+            patched_model._guidance_pipeline = model._guidance_pipeline
+            patched_model.set_model_sampler_post_cfg_function(
+                patched_model._guidance_pipeline.run, "custom_guidance_pipeline"
+            )
+
         pipeline = ensure_guidance_pipeline(patched_model)
         pipeline.add_modifier("s2_guidance", make_s2_modifier(patched_model, s2_drop_ratio, s2_scale_omega))
         logging.debug(

@@ -24,6 +24,13 @@ class CFGZeroNode:
             return (model,)
 
         patched_model = model.clone()
+
+        if hasattr(model, "_guidance_pipeline"):
+            patched_model._guidance_pipeline = model._guidance_pipeline
+            patched_model.set_model_sampler_post_cfg_function(
+                patched_model._guidance_pipeline.run, "custom_guidance_pipeline"
+            )
+
         pipeline = ensure_guidance_pipeline(patched_model)
         initial_sigma = get_initial_sigma(patched_model)
         pipeline.set_base_builder(make_cfg_zero_base_builder(zero_init_first_step, initial_sigma))

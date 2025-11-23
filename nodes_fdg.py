@@ -26,6 +26,13 @@ class FDGNode:
             return (model,)
 
         patched_model = model.clone()
+
+        if hasattr(model, "_guidance_pipeline"):
+            patched_model._guidance_pipeline = model._guidance_pipeline
+            patched_model.set_model_sampler_post_cfg_function(
+                patched_model._guidance_pipeline.run, "custom_guidance_pipeline"
+            )
+
         pipeline = ensure_guidance_pipeline(patched_model)
         pipeline.add_modifier("fdg", make_fdg_modifier(w_low, w_high, int(fdg_levels)))
         logging.debug(f"Patched model with FDG enabled={fdg_enabled}, w_low={w_low}, w_high={w_high}, levels={fdg_levels}")
