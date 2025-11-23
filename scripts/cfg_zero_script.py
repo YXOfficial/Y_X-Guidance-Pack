@@ -7,7 +7,7 @@ from modules import scripts, script_callbacks
 from functools import partial
 from typing import Any
 
-from CFGZERO.nodes_cfg_zero import CFGZeroNode
+from nodes_cfg_zero import CFGZeroNode
 
 class CFGZeroScript(scripts.Script):
     def __init__(self):
