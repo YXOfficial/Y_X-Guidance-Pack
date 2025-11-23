@@ -1,6 +1,6 @@
 import logging
 
-from guidance_utils import ensure_guidance_pipeline, make_fdg_modifier
+from yx_guidance_utils import ensure_guidance_pipeline, make_fdg_modifier
 
 
 class FDGNode:

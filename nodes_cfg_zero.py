@@ -1,6 +1,6 @@
 import logging
 
-from guidance_utils import ensure_guidance_pipeline, get_initial_sigma, make_cfg_zero_base_builder
+from yx_guidance_utils import ensure_guidance_pipeline, get_initial_sigma, make_cfg_zero_base_builder
 
 
 class CFGZeroNode:

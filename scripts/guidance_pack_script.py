@@ -6,7 +6,7 @@ from functools import partial
 import gradio as gr
 from modules import scripts, script_callbacks
 
-from guidance_utils import clear_generation_params_once, reset_unet_if_needed
+from yx_guidance_utils import clear_generation_params_once, reset_unet_if_needed
 from nodes_cfg_zero import CFGZeroNode
 from nodes_fdg import FDGNode
 from nodes_zeresfdg import ZeResFDGNode
