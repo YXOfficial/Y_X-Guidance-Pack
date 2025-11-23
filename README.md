@@ -1,16 +1,12 @@
-# Reforge
-CFG Zero paper: https://arxiv.org/abs/2503.18886
-Frequency-Decoupled Guidance paper: https://arxiv.org/pdf/2506.19713
+# ⚠️ Although everything "WORKS" but my implementation code might be inaccuracy, still need someone check it out too
 
-# Comfyui (my guidance pack doesn't support comfyui lol)
-Someone already done those guidance, just search "FDG comfyui" or "CFG Zero comfyui", etc
+# [Test-Reforge](https://github.com/YXOfficial/Test-reForge)
 
+# Comfyui (Wait for support)
 
 # To do
-- [ ] TPG https://github.com/TaatiTeam/Token-Perturbation-Guidance/blob/main/pipeline_sdxl_tpg.py
-- [ ] LI CFG https://arxiv.org/pdf/2501.11236
-- [ ] CCFG https://arxiv.org/abs/2411.17077 (Outdated⚠️)
-- [ ] CFGIG https://arxiv.org/pdf/2505.21101
-- [ ] NAG https://github.com/ChenDarYen/Normalized-Attention-Guidance
-- [x] CFG Zero https://arxiv.org/abs/2503.18886
-- [x] FDG https://arxiv.org/pdf/2506.19713
+- [x] [ZeResFDG](https://arxiv.org/pdf/2510.12954) 
+- [x] [CFG Zero](https://arxiv.org/abs/2503.18886)
+- [x] [FDG](https://arxiv.org/pdf/2506.19713)
+# [sd-perturbed-attention-shit](https://github.com/YXOfficial/sd-perturbed-attention-shit)
+- [x] Init noise https://arxiv.org/pdf/2510.08625
