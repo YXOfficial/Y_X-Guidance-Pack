@@ -1,1 +1,2 @@
 # Do not add/edit/run Test-reforge, read only as document
+# Do not write comfyui support nodes
