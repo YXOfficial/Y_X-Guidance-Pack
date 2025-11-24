@@ -521,6 +521,43 @@ def make_qsilk_modifier(
     return modifier
 
 
+def enable_qsilk_modifier(
+    model,
+    micro_q_low: float = 0.001,
+    micro_q_high: float = 0.999,
+    micro_alpha: float = 2.0,
+    use_aqclip: bool = True,
+    tile_size: int = 32,
+    stride: int = 16,
+    aqclip_alpha: float = 2.0,
+    ema_beta: float = 0.8,
+):
+    """Attach the QSilk modifier to the model's guidance pipeline.
+
+    This keeps QSilk purely code-configured while ensuring it executes last in
+    the pipeline order without adding any UI/node bindings.
+    """
+
+    pipeline = ensure_guidance_pipeline(model)
+    modifier = make_qsilk_modifier(
+        micro_q_low=micro_q_low,
+        micro_q_high=micro_q_high,
+        micro_alpha=micro_alpha,
+        use_aqclip=use_aqclip,
+        tile_size=tile_size,
+        stride=stride,
+        aqclip_alpha=aqclip_alpha,
+        ema_beta=ema_beta,
+    )
+
+    # Preserve insertion order by re-inserting to keep QSilk last.
+    if "qsilk" in pipeline.modifiers:
+        pipeline.modifiers.pop("qsilk")
+    pipeline.add_modifier("qsilk", modifier)
+
+    return pipeline
+
+
 GUIDANCE_PARAM_KEYS = [
     "CFG-Zero Enabled",
     "CFG-Zero Init First Step",
