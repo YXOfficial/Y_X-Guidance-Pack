@@ -1,4 +1,5 @@
 import logging
+import math
 import random
 from typing import Callable, Dict
 
@@ -58,6 +59,116 @@ def get_initial_sigma(model) -> float:
     except AttributeError:
         logging.warning("Custom Guidance: Could not determine initial_sigma.")
         return float("inf")
+
+
+def qsilk_micrograin(
+    x: torch.Tensor,
+    q_low: float = 0.001,
+    q_high: float = 0.999,
+    alpha: float = 2.0,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    if x.dim() != 4:
+        return x
+
+    original_dtype = x.dtype
+    x_float = x.float()
+    batch_size = x_float.shape[0]
+    flattened = x_float.view(batch_size, -1)
+
+    low = torch.quantile(flattened, q_low, dim=1)
+    high = torch.quantile(flattened, q_high, dim=1)
+
+    mid = (low + high) * 0.5
+    delta = (high - low) * 0.5
+
+    mid = mid.view(batch_size, 1, 1, 1)
+    delta = delta.view(batch_size, 1, 1, 1)
+
+    normed = (x_float - mid) / (delta + eps)
+    stabilized = mid + delta * torch.tanh(alpha * normed)
+    return stabilized.to(dtype=original_dtype)
+
+
+def ndtri(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    q_clamped = torch.clamp(q, eps, 1.0 - eps)
+    return math.sqrt(2.0) * torch.erfinv(q_clamped * 2.0 - 1.0)
+
+
+def qsilk_aqclip_lite(
+    x: torch.Tensor,
+    tile_size: int = 32,
+    stride: int = 16,
+    alpha: float = 2.0,
+    ema_state: Dict[str, torch.Tensor] | None = None,
+    ema_beta: float = 0.8,
+    eps: float = 1e-8,
+):
+    if ema_state is None:
+        ema_state = {}
+    if x.dim() != 4:
+        return x, ema_state
+
+    original_dtype = x.dtype
+    x_float = x.float()
+    b, c, h, w = x_float.shape
+
+    z_m = x_float.mean(dim=1, keepdim=True)
+
+    g_x = z_m[:, :, :, 2:] - z_m[:, :, :, :-2]
+    g_y = z_m[:, :, 2:, :] - z_m[:, :, :-2, :]
+    g_x = F.pad(g_x, (1, 1, 0, 0))
+    g_y = F.pad(g_y, (0, 0, 1, 1))
+    g = torch.sqrt(g_x ** 2 + g_y ** 2)
+
+    g_abs = g.abs()
+    g_max = g_abs.amax(dim=(2, 3), keepdim=True)
+    if torch.all(g_max <= eps):
+        return x, ema_state
+
+    g_norm = g_abs / (g_max + eps)
+
+    g_grid = F.avg_pool2d(g_norm, kernel_size=tile_size, stride=stride)
+    q_low_tile = 0.5 * (g_grid ** 2)
+    q_high_tile = 1.0 - 0.5 * ((1.0 - g_grid) ** 2)
+
+    unfold = torch.nn.Unfold(kernel_size=tile_size, stride=stride)
+    fold = torch.nn.Fold(output_size=(h, w), kernel_size=tile_size, stride=stride)
+
+    x_flat = x_float.view(b * c, 1, h, w)
+    patches = unfold(x_flat)
+    mu = patches.mean(dim=1, keepdim=True)
+    sigma = patches.std(dim=1, keepdim=True) + eps
+
+    q_low_flat = q_low_tile.view(b, 1, -1)
+    q_high_flat = q_high_tile.view(b, 1, -1)
+    q_low_bc = q_low_flat.repeat_interleave(c, dim=0)
+    q_high_bc = q_high_flat.repeat_interleave(c, dim=0)
+
+    low_corridor = mu + sigma * ndtri(q_low_bc, eps)
+    high_corridor = mu + sigma * ndtri(q_high_bc, eps)
+
+    if "l" not in ema_state or ema_state["l"].shape != low_corridor.shape:
+        ema_state["l"] = low_corridor.detach()
+        ema_state["h"] = high_corridor.detach()
+    else:
+        ema_state["l"] = ema_beta * ema_state["l"] + (1.0 - ema_beta) * low_corridor.detach()
+        ema_state["h"] = ema_beta * ema_state["h"] + (1.0 - ema_beta) * high_corridor.detach()
+
+    l_corridor = ema_state["l"]
+    h_corridor = ema_state["h"]
+
+    m = 0.5 * (l_corridor + h_corridor)
+    delta = 0.5 * (h_corridor - l_corridor)
+    normed = (patches - m) / (delta + eps)
+    patches_clipped = m + delta * torch.tanh(alpha * normed)
+
+    x_clipped_flat = fold(patches_clipped)
+    norm = fold(unfold(torch.ones_like(x_flat)))
+    x_clipped_flat = x_clipped_flat / (norm + eps)
+    x_clipped = x_clipped_flat.view(b, c, h, w)
+
+    return x_clipped.to(dtype=original_dtype), ema_state
 
 
 def make_cfg_zero_base_builder(zero_init_first_step: bool, initial_sigma: float) -> Callable:
@@ -368,6 +479,44 @@ def make_s2_modifier(model, s2_drop_ratio: float, s2_scale_omega: float) -> Call
         new_prediction = state.prediction - s2_scale_omega * denoised_s
         zero_term = torch.zeros_like(state.guidance_term)
         return GuidanceState(new_prediction, zero_term)
+
+    return modifier
+
+
+def make_qsilk_modifier(
+    micro_q_low: float = 0.001,
+    micro_q_high: float = 0.999,
+    micro_alpha: float = 2.0,
+    use_aqclip: bool = True,
+    tile_size: int = 32,
+    stride: int = 16,
+    aqclip_alpha: float = 2.0,
+    ema_beta: float = 0.8,
+) -> Callable:
+    ema_state: Dict[str, torch.Tensor] = {}
+
+    def modifier(args, state: GuidanceState) -> GuidanceState:
+        nonlocal ema_state
+
+        pred = qsilk_micrograin(
+            state.prediction,
+            q_low=micro_q_low,
+            q_high=micro_q_high,
+            alpha=micro_alpha,
+        )
+
+        if use_aqclip:
+            pred, ema_state = qsilk_aqclip_lite(
+                pred,
+                tile_size=tile_size,
+                stride=stride,
+                alpha=aqclip_alpha,
+                ema_state=ema_state,
+                ema_beta=ema_beta,
+            )
+
+        guidance_term = pred - state.base_prediction
+        return GuidanceState(state.base_prediction, guidance_term)
 
     return modifier
 
