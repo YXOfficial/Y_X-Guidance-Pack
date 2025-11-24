@@ -5,7 +5,7 @@
 # Comfyui (Wait for support)
 
 # To do
-- [ ] [QSilk](https://arxiv.org/pdf/2510.12954) ⚠️Issue: Unknown, image: https://github.com/user-attachments/assets/71447d8f-1c79-4dab-8fc0-0e60a03a9134
+- [ ] [QSilk](https://arxiv.org/pdf/2510.12954) ⚠️Issue: Unknown, https://imgsli.com/NDMwNjMz
 - [x] [ZeResFDG](https://arxiv.org/pdf/2510.12954) 
 - [x] [CFG Zero](https://arxiv.org/abs/2503.18886)
 - [x] [FDG](https://arxiv.org/pdf/2506.19713)
