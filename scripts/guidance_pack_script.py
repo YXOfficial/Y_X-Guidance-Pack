@@ -6,7 +6,12 @@ from functools import partial
 import gradio as gr
 from modules import scripts, script_callbacks
 
-from yx_guidance_utils import clear_generation_params_once, reset_unet_if_needed
+from yx_guidance_utils import (
+    clear_generation_params_once,
+    ensure_guidance_pipeline,
+    make_qsilk_modifier,
+    reset_unet_if_needed,
+)
 from nodes_cfg_zero import CFGZeroNode
 from nodes_fdg import FDGNode
 from nodes_zeresfdg import ZeResFDGNode
@@ -36,6 +41,16 @@ class GuidancePackScript(scripts.Script):
         self.s2_guidance_enabled = False
         self.s2_scale_omega = 0.25
         self.s2_drop_ratio = 0.1
+
+        self.qsilk_enabled = False
+        self.micro_q_low = 0.001
+        self.micro_q_high = 0.999
+        self.micro_alpha = 2.0
+        self.qsilk_use_aqclip = True
+        self.qsilk_tile_size = 32
+        self.qsilk_stride = 16
+        self.qsilk_aqclip_alpha = 2.0
+        self.qsilk_ema_beta = 0.8
 
         self.cfg_zero_node = CFGZeroNode()
         self.fdg_node = FDGNode()
@@ -118,6 +133,63 @@ class GuidancePackScript(scripts.Script):
                         info="Tỷ lệ khối UNet/DiT bị bỏ qua. Bài báo đề xuất ~0.1 (10%)",
                     )
 
+                with gr.Tab(label="QSilk"):
+                    gr.Markdown("Stabilize denoised latents with Micrograin + AQClip-Lite.")
+                    qsilk_enabled = gr.Checkbox(label="Enable QSilk", value=self.qsilk_enabled)
+                    micro_q_low = gr.Slider(
+                        label="Micrograin q_low",
+                        minimum=0.0,
+                        maximum=0.01,
+                        step=0.0001,
+                        value=self.micro_q_low,
+                    )
+                    micro_q_high = gr.Slider(
+                        label="Micrograin q_high",
+                        minimum=0.95,
+                        maximum=1.0,
+                        step=0.0001,
+                        value=self.micro_q_high,
+                    )
+                    micro_alpha = gr.Slider(
+                        label="Micrograin α",
+                        minimum=0.1,
+                        maximum=10.0,
+                        step=0.1,
+                        value=self.micro_alpha,
+                    )
+                    qsilk_use_aqclip = gr.Checkbox(
+                        label="Enable AQClip-Lite", value=self.qsilk_use_aqclip
+                    )
+                    qsilk_tile_size = gr.Slider(
+                        label="AQClip Tile Size",
+                        minimum=8,
+                        maximum=128,
+                        step=8,
+                        value=self.qsilk_tile_size,
+                    )
+                    qsilk_stride = gr.Slider(
+                        label="AQClip Stride",
+                        minimum=4,
+                        maximum=128,
+                        step=4,
+                        value=self.qsilk_stride,
+                        info="Should be ≤ tile size to allow overlap",
+                    )
+                    qsilk_aqclip_alpha = gr.Slider(
+                        label="AQClip α",
+                        minimum=0.1,
+                        maximum=10.0,
+                        step=0.1,
+                        value=self.qsilk_aqclip_alpha,
+                    )
+                    qsilk_ema_beta = gr.Slider(
+                        label="AQClip EMA β",
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        value=self.qsilk_ema_beta,
+                    )
+
         cfg_zero_enabled.change(lambda x: setattr(self, "cfg_zero_enabled", x), inputs=[cfg_zero_enabled], outputs=None)
         zero_init_first_step.change(
             lambda x: setattr(self, "zero_init_first_step", x), inputs=[zero_init_first_step], outputs=None
@@ -145,6 +217,22 @@ class GuidancePackScript(scripts.Script):
         s2_scale_omega.change(lambda x: setattr(self, "s2_scale_omega", x), inputs=[s2_scale_omega], outputs=None)
         s2_drop_ratio.change(lambda x: setattr(self, "s2_drop_ratio", x), inputs=[s2_drop_ratio], outputs=None)
 
+        qsilk_enabled.change(lambda x: setattr(self, "qsilk_enabled", x), inputs=[qsilk_enabled], outputs=None)
+        micro_q_low.change(lambda x: setattr(self, "micro_q_low", x), inputs=[micro_q_low], outputs=None)
+        micro_q_high.change(lambda x: setattr(self, "micro_q_high", x), inputs=[micro_q_high], outputs=None)
+        micro_alpha.change(lambda x: setattr(self, "micro_alpha", x), inputs=[micro_alpha], outputs=None)
+        qsilk_use_aqclip.change(
+            lambda x: setattr(self, "qsilk_use_aqclip", x), inputs=[qsilk_use_aqclip], outputs=None
+        )
+        qsilk_tile_size.change(
+            lambda x: setattr(self, "qsilk_tile_size", x), inputs=[qsilk_tile_size], outputs=None
+        )
+        qsilk_stride.change(lambda x: setattr(self, "qsilk_stride", x), inputs=[qsilk_stride], outputs=None)
+        qsilk_aqclip_alpha.change(
+            lambda x: setattr(self, "qsilk_aqclip_alpha", x), inputs=[qsilk_aqclip_alpha], outputs=None
+        )
+        qsilk_ema_beta.change(lambda x: setattr(self, "qsilk_ema_beta", x), inputs=[qsilk_ema_beta], outputs=None)
+
         self.ui_controls = [
             cfg_zero_enabled,
             zero_init_first_step,
@@ -163,6 +251,15 @@ class GuidancePackScript(scripts.Script):
             s2_guidance_enabled,
             s2_scale_omega,
             s2_drop_ratio,
+            qsilk_enabled,
+            micro_q_low,
+            micro_q_high,
+            micro_alpha,
+            qsilk_use_aqclip,
+            qsilk_tile_size,
+            qsilk_stride,
+            qsilk_aqclip_alpha,
+            qsilk_ema_beta,
         ]
         return self.ui_controls
 
@@ -187,6 +284,15 @@ class GuidancePackScript(scripts.Script):
                 self.s2_guidance_enabled,
                 self.s2_scale_omega,
                 self.s2_drop_ratio,
+                self.qsilk_enabled,
+                self.micro_q_low,
+                self.micro_q_high,
+                self.micro_alpha,
+                self.qsilk_use_aqclip,
+                self.qsilk_tile_size,
+                self.qsilk_stride,
+                self.qsilk_aqclip_alpha,
+                self.qsilk_ema_beta,
             ) = args[:expected_args]
         else:
             logging.warning("Guidance Pack: Not enough arguments provided from UI.")
@@ -233,6 +339,26 @@ class GuidancePackScript(scripts.Script):
             self.s2_scale_omega = float(s2_guidance_xyz["s2_omega"])
         if "s2_drop" in s2_guidance_xyz:
             self.s2_drop_ratio = float(s2_guidance_xyz["s2_drop"])
+
+        qsilk_xyz = xyz_settings.get("qsilk", {})
+        if "qsilk_enabled" in qsilk_xyz:
+            self.qsilk_enabled = str(qsilk_xyz["qsilk_enabled"]).lower() == "true"
+        if "micro_q_low" in qsilk_xyz:
+            self.micro_q_low = float(qsilk_xyz["micro_q_low"])
+        if "micro_q_high" in qsilk_xyz:
+            self.micro_q_high = float(qsilk_xyz["micro_q_high"])
+        if "micro_alpha" in qsilk_xyz:
+            self.micro_alpha = float(qsilk_xyz["micro_alpha"])
+        if "use_aqclip" in qsilk_xyz:
+            self.qsilk_use_aqclip = str(qsilk_xyz["use_aqclip"]).lower() == "true"
+        if "tile_size" in qsilk_xyz:
+            self.qsilk_tile_size = int(qsilk_xyz["tile_size"])
+        if "stride" in qsilk_xyz:
+            self.qsilk_stride = int(qsilk_xyz["stride"])
+        if "aqclip_alpha" in qsilk_xyz:
+            self.qsilk_aqclip_alpha = float(qsilk_xyz["aqclip_alpha"])
+        if "ema_beta" in qsilk_xyz:
+            self.qsilk_ema_beta = float(qsilk_xyz["ema_beta"])
 
         restored = reset_unet_if_needed(p)
         if restored:
@@ -321,6 +447,48 @@ class GuidancePackScript(scripts.Script):
                 self.s2_drop_ratio,
             )
 
+        pipeline = None
+        needs_qsilk_pipeline = self.qsilk_enabled or hasattr(p.sd_model.forge_objects.unet, "_guidance_pipeline")
+        if needs_qsilk_pipeline:
+            pipeline = ensure_guidance_pipeline(p.sd_model.forge_objects.unet)
+
+        if self.qsilk_enabled and pipeline is not None:
+            pipeline.add_modifier(
+                "qsilk",
+                make_qsilk_modifier(
+                    micro_q_low=self.micro_q_low,
+                    micro_q_high=self.micro_q_high,
+                    micro_alpha=self.micro_alpha,
+                    use_aqclip=self.qsilk_use_aqclip,
+                    tile_size=int(self.qsilk_tile_size),
+                    stride=int(self.qsilk_stride),
+                    aqclip_alpha=self.qsilk_aqclip_alpha,
+                    ema_beta=self.qsilk_ema_beta,
+                ),
+            )
+            p.extra_generation_params["QSilk Enabled"] = self.qsilk_enabled
+            p.extra_generation_params["QSilk micro_q_low"] = self.micro_q_low
+            p.extra_generation_params["QSilk micro_q_high"] = self.micro_q_high
+            p.extra_generation_params["QSilk micro_alpha"] = self.micro_alpha
+            p.extra_generation_params["QSilk use_aqclip"] = self.qsilk_use_aqclip
+            p.extra_generation_params["QSilk tile_size"] = int(self.qsilk_tile_size)
+            p.extra_generation_params["QSilk stride"] = int(self.qsilk_stride)
+            p.extra_generation_params["QSilk aqclip_alpha"] = self.qsilk_aqclip_alpha
+            p.extra_generation_params["QSilk ema_beta"] = self.qsilk_ema_beta
+            logging.debug(
+                "QSilk: Applied with micrograin (%s, %s, %s) and AQClip (%s, tile=%s, stride=%s, alpha=%s, ema=%s)",
+                self.micro_q_low,
+                self.micro_q_high,
+                self.micro_alpha,
+                self.qsilk_use_aqclip,
+                self.qsilk_tile_size,
+                self.qsilk_stride,
+                self.qsilk_aqclip_alpha,
+                self.qsilk_ema_beta,
+            )
+        elif pipeline is not None and "qsilk" in pipeline.modifiers:
+            pipeline.modifiers.pop("qsilk", None)
+
         return
 
 
@@ -340,7 +508,7 @@ def make_guidance_axis_on_xyz_grid():
     if xyz_grid is None:
         return
 
-    prefixes = ["(CFG-Zero)", "(FDG)", "(ZeResFDG)", "(S2-Guidance)"]
+    prefixes = ["(CFG-Zero)", "(FDG)", "(ZeResFDG)", "(S2-Guidance)", "(QSilk)"]
     if any(opt.label.startswith(prefix) for opt in xyz_grid.axis_options for prefix in prefixes):
         return
 
@@ -425,6 +593,53 @@ def make_guidance_axis_on_xyz_grid():
             label="(S2-Guidance) Drop Ratio",
             type=float,
             apply=partial(set_guidance_value, feature="s2_guidance", field="s2_drop"),
+        ),
+        xyz_grid.AxisOption(
+            label="(QSilk) Enabled",
+            type=str,
+            apply=partial(set_guidance_value, feature="qsilk", field="qsilk_enabled"),
+            choices=lambda: ["True", "False"],
+        ),
+        xyz_grid.AxisOption(
+            label="(QSilk) micro_q_low",
+            type=float,
+            apply=partial(set_guidance_value, feature="qsilk", field="micro_q_low"),
+        ),
+        xyz_grid.AxisOption(
+            label="(QSilk) micro_q_high",
+            type=float,
+            apply=partial(set_guidance_value, feature="qsilk", field="micro_q_high"),
+        ),
+        xyz_grid.AxisOption(
+            label="(QSilk) micro_alpha",
+            type=float,
+            apply=partial(set_guidance_value, feature="qsilk", field="micro_alpha"),
+        ),
+        xyz_grid.AxisOption(
+            label="(QSilk) use_aqclip",
+            type=str,
+            apply=partial(set_guidance_value, feature="qsilk", field="use_aqclip"),
+            choices=lambda: ["True", "False"],
+        ),
+        xyz_grid.AxisOption(
+            label="(QSilk) tile_size",
+            type=int,
+            apply=partial(set_guidance_value, feature="qsilk", field="tile_size"),
+        ),
+        xyz_grid.AxisOption(
+            label="(QSilk) stride",
+            type=int,
+            apply=partial(set_guidance_value, feature="qsilk", field="stride"),
+        ),
+        xyz_grid.AxisOption(
+            label="(QSilk) aqclip_alpha",
+            type=float,
+            apply=partial(set_guidance_value, feature="qsilk", field="aqclip_alpha"),
+        ),
+        xyz_grid.AxisOption(
+            label="(QSilk) ema_beta",
+            type=float,
+            apply=partial(set_guidance_value, feature="qsilk", field="ema_beta"),
         ),
     ]
     xyz_grid.axis_options.extend(options)

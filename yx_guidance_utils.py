@@ -1,6 +1,6 @@
 import logging
 import random
-from typing import Callable, Dict
+from typing import Callable, Dict, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -50,6 +50,161 @@ def ensure_guidance_pipeline(model) -> GuidancePipeline:
         model._guidance_pipeline = pipeline
         model.set_model_sampler_post_cfg_function(pipeline.run, "custom_guidance_pipeline")
     return model._guidance_pipeline
+
+
+def qsilk_micrograin(
+    x: torch.Tensor, q_low: float = 0.001, q_high: float = 0.999, alpha: float = 2.0, eps: float = 1e-8
+) -> torch.Tensor:
+    """Smooth per-sample clipping based on global quantiles.
+
+    Args:
+        x: Latent tensor with shape [B, C, H, W]. If dimensionality differs, the tensor is returned unchanged.
+        q_low: Lower quantile.
+        q_high: Upper quantile.
+        alpha: Tanh softness scale.
+        eps: Numerical stability term.
+
+    Returns:
+        Tensor with the same shape/dtype/device as ``x`` after smooth clipping.
+    """
+
+    if x.dim() != 4:
+        return x
+
+    dtype = x.dtype
+    device = x.device
+    b = x.shape[0]
+    x_float = x.float()
+    flat = x_float.view(b, -1)
+
+    try:
+        quantiles = torch.quantile(flat, torch.tensor([q_low, q_high], device=device, dtype=x_float.dtype), dim=1)
+        l, h = quantiles[0], quantiles[1]
+    except Exception:
+        logging.warning("QSilk: torch.quantile unavailable; skipping micrograin stabilization this step.")
+        return x
+
+    m = ((l + h) / 2).view(b, 1, 1, 1)
+    delta = ((h - l) / 2).view(b, 1, 1, 1)
+    normed = (x_float - m) / (delta + eps)
+    clipped = m + delta * torch.tanh(alpha * normed)
+    return clipped.to(dtype=dtype)
+
+
+def ndtri(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """Inverse normal CDF via erfinv for tensor inputs."""
+
+    q_clamped = q.clamp(eps, 1.0 - eps)
+    return torch.sqrt(torch.tensor(2.0, device=q.device, dtype=q.dtype)) * torch.erfinv(2 * q_clamped - 1)
+
+
+def qsilk_aqclip_lite(
+    x: torch.Tensor,
+    tile_size: int = 32,
+    stride: int = 16,
+    alpha: float = 2.0,
+    ema_state: Optional[Dict[str, torch.Tensor]] = None,
+    ema_beta: float = 0.8,
+    eps: float = 1e-8,
+) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+    """Adaptive quantile clipping with tile-wise EMA corridors."""
+
+    if ema_state is None:
+        ema_state = {}
+
+    if x.dim() != 4:
+        return x, ema_state
+
+    dtype = x.dtype
+    device = x.device
+    b, c, h, w = x.shape
+    x_float = x.float()
+
+    z_m = x_float.mean(dim=1, keepdim=True)
+
+    g_x = F.pad(z_m[..., 2:] - z_m[..., :-2], (1, 1, 0, 0))
+    g_y = F.pad(z_m[..., 2:, :] - z_m[..., :-2, :], (0, 0, 1, 1))
+    g = torch.sqrt(g_x**2 + g_y**2)
+
+    g_abs = g.abs()
+    g_max = g_abs.amax(dim=(2, 3), keepdim=True)
+    if torch.all(g_max <= eps):
+        return x, ema_state
+
+    g_norm = g_abs / (g_max + eps)
+    g_grid = F.avg_pool2d(g_norm, kernel_size=tile_size, stride=stride)
+
+    q_low_tile = 0.5 * (g_grid**2)
+    q_high_tile = 1.0 - 0.5 * ((1.0 - g_grid) ** 2)
+
+    unfold = torch.nn.Unfold(kernel_size=tile_size, stride=stride)
+    fold = torch.nn.Fold(output_size=(h, w), kernel_size=tile_size, stride=stride)
+    x_flat = x_float.view(b * c, 1, h, w)
+    patches = unfold(x_flat)
+
+    mu = patches.mean(dim=1, keepdim=True)
+    sigma = patches.std(dim=1, keepdim=True) + eps
+
+    q_low_flat = q_low_tile.view(b, 1, -1)
+    q_high_flat = q_high_tile.view(b, 1, -1)
+    q_low_bc = q_low_flat.repeat_interleave(c, dim=0)
+    q_high_bc = q_high_flat.repeat_interleave(c, dim=0)
+
+    l = mu + sigma * ndtri(q_low_bc, eps=eps)
+    h_corr = mu + sigma * ndtri(q_high_bc, eps=eps)
+
+    if "l" not in ema_state or ema_state.get("l") is None or ema_state["l"].shape != l.shape:
+        ema_state["l"] = l.detach()
+        ema_state["h"] = h_corr.detach()
+    else:
+        ema_state["l"] = ema_beta * ema_state["l"] + (1.0 - ema_beta) * l.detach()
+        ema_state["h"] = ema_beta * ema_state["h"] + (1.0 - ema_beta) * h_corr.detach()
+
+    m = (ema_state["l"] + ema_state["h"]) / 2
+    delta = (ema_state["h"] - ema_state["l"]) / 2
+
+    normed = (patches - m) / (delta + eps)
+    patched = m + delta * torch.tanh(alpha * normed)
+
+    x_clipped_flat = fold(patched)
+    norm = fold(unfold(torch.ones_like(x_flat)))
+    x_clipped_flat = x_clipped_flat / (norm + eps)
+    x_clipped = x_clipped_flat.view(b, c, h, w)
+
+    return x_clipped.to(dtype=dtype), ema_state
+
+
+def make_qsilk_modifier(
+    micro_q_low: float = 0.001,
+    micro_q_high: float = 0.999,
+    micro_alpha: float = 2.0,
+    use_aqclip: bool = True,
+    tile_size: int = 32,
+    stride: int = 16,
+    aqclip_alpha: float = 2.0,
+    ema_beta: float = 0.8,
+) -> Callable:
+    ema_state: Dict[str, torch.Tensor] = {}
+
+    def modifier(args, state: GuidanceState) -> GuidanceState:
+        nonlocal ema_state
+        pred = state.prediction
+        pred = qsilk_micrograin(pred, q_low=micro_q_low, q_high=micro_q_high, alpha=micro_alpha)
+
+        if use_aqclip:
+            pred, ema_state = qsilk_aqclip_lite(
+                pred,
+                tile_size=tile_size,
+                stride=stride,
+                alpha=aqclip_alpha,
+                ema_state=ema_state,
+                ema_beta=ema_beta,
+            )
+
+        guidance_term = pred - state.base_prediction
+        return GuidanceState(state.base_prediction, guidance_term)
+
+    return modifier
 
 
 def get_initial_sigma(model) -> float:
@@ -390,6 +545,15 @@ GUIDANCE_PARAM_KEYS = [
     "S2-Guidance Enabled",
     "S2-Guidance Omega",
     "S2-Guidance Drop Ratio",
+    "QSilk Enabled",
+    "QSilk micro_q_low",
+    "QSilk micro_q_high",
+    "QSilk micro_alpha",
+    "QSilk use_aqclip",
+    "QSilk tile_size",
+    "QSilk stride",
+    "QSilk aqclip_alpha",
+    "QSilk ema_beta",
 ]
 
 
