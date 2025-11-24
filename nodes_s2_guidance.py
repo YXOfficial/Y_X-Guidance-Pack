@@ -1,6 +1,6 @@
 import logging
 
-from guidance_utils import ensure_guidance_pipeline, make_s2_modifier
+from yx_guidance_utils import ensure_guidance_pipeline, make_s2_modifier
 
 
 class S2GuidanceNode:

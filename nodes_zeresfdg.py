@@ -1,6 +1,6 @@
 import logging
 
-from guidance_utils import ensure_guidance_pipeline, make_zeresfdg_base_builder, make_zeresfdg_modifier
+from yx_guidance_utils import ensure_guidance_pipeline, make_zeresfdg_base_builder, make_zeresfdg_modifier
 
 
 class ZeResFDGNode:
