@@ -4,10 +4,17 @@
 
 # Comfyui (Wait for support)
 
-# To do
+
+
+# Sampling Method
+- [ ] [GAS](https://arxiv.org/pdf/2510.17699)
+      
+# Guidance
 - [ ] [QSilk](https://arxiv.org/pdf/2510.12954) ⚠️Issue: Unknown, https://imgsli.com/NDMwNjMz
 - [x] [ZeResFDG](https://arxiv.org/pdf/2510.12954) 
 - [x] [CFG Zero](https://arxiv.org/abs/2503.18886)
 - [x] [FDG](https://arxiv.org/pdf/2506.19713)
+      
 # [sd-perturbed-attention-shit](https://github.com/YXOfficial/sd-perturbed-attention-shit)
 - [x] Init noise https://arxiv.org/pdf/2510.08625
+- [ ] [ASAG](https://arxiv.org/pdf/2511.07499)
