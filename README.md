@@ -7,7 +7,7 @@
 
 
 # Sampling Method
-- [ ] [GAS](https://arxiv.org/pdf/2510.17699)
+- [ ] Unknown
       
 # Guidance
 - [ ] [QSilk](https://arxiv.org/pdf/2510.12954) ⚠️Issue: Unknown, https://imgsli.com/NDMwNjMz
@@ -17,4 +17,4 @@
       
 # [sd-perturbed-attention-shit](https://github.com/YXOfficial/sd-perturbed-attention-shit)
 - [x] Init noise https://arxiv.org/pdf/2510.08625
-- [ ] [ASAG](https://arxiv.org/pdf/2511.07499)
+- [x] [ASAG](https://arxiv.org/pdf/2511.07499)
