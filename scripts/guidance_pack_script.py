@@ -46,7 +46,10 @@ class GuidancePackScript(scripts.Script):
         self.micro_q_low = 0.001
         self.micro_q_high = 0.999
         self.micro_alpha = 2.0
-        self.qsilk_use_aqclip = True
+        self.qsilk_vp_mix = 0.15
+        self.qsilk_per_channel = False
+        self.qsilk_late_weighting = True
+        self.qsilk_use_aqclip = False
         self.qsilk_tile_size = 32
         self.qsilk_stride = 16
         self.qsilk_aqclip_alpha = 2.0
@@ -157,6 +160,24 @@ class GuidancePackScript(scripts.Script):
                         step=0.1,
                         value=self.micro_alpha,
                     )
+                    qsilk_vp_mix = gr.Slider(
+                        label="Micrograin VP-Mix",
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        value=self.qsilk_vp_mix,
+                        info="Blend toward variance-preserving remap (0=off, default 0.15).",
+                    )
+                    qsilk_per_channel = gr.Checkbox(
+                        label="Micrograin Per-Channel (slower)",
+                        value=self.qsilk_per_channel,
+                        info="Compute quantiles/VP stats per channel; can be slower.",
+                    )
+                    qsilk_late_weighting = gr.Checkbox(
+                        label="Late-Step Weighting",
+                        value=self.qsilk_late_weighting,
+                        info="Fade in micrograin over sampling steps to reduce early color feedback.",
+                    )
                     qsilk_use_aqclip = gr.Checkbox(
                         label="Enable AQClip-Lite", value=self.qsilk_use_aqclip
                     )
@@ -221,6 +242,13 @@ class GuidancePackScript(scripts.Script):
         micro_q_low.change(lambda x: setattr(self, "micro_q_low", x), inputs=[micro_q_low], outputs=None)
         micro_q_high.change(lambda x: setattr(self, "micro_q_high", x), inputs=[micro_q_high], outputs=None)
         micro_alpha.change(lambda x: setattr(self, "micro_alpha", x), inputs=[micro_alpha], outputs=None)
+        qsilk_vp_mix.change(lambda x: setattr(self, "qsilk_vp_mix", x), inputs=[qsilk_vp_mix], outputs=None)
+        qsilk_per_channel.change(
+            lambda x: setattr(self, "qsilk_per_channel", x), inputs=[qsilk_per_channel], outputs=None
+        )
+        qsilk_late_weighting.change(
+            lambda x: setattr(self, "qsilk_late_weighting", x), inputs=[qsilk_late_weighting], outputs=None
+        )
         qsilk_use_aqclip.change(
             lambda x: setattr(self, "qsilk_use_aqclip", x), inputs=[qsilk_use_aqclip], outputs=None
         )
@@ -255,6 +283,9 @@ class GuidancePackScript(scripts.Script):
             micro_q_low,
             micro_q_high,
             micro_alpha,
+            qsilk_vp_mix,
+            qsilk_per_channel,
+            qsilk_late_weighting,
             qsilk_use_aqclip,
             qsilk_tile_size,
             qsilk_stride,
@@ -288,6 +319,9 @@ class GuidancePackScript(scripts.Script):
                 self.micro_q_low,
                 self.micro_q_high,
                 self.micro_alpha,
+                self.qsilk_vp_mix,
+                self.qsilk_per_channel,
+                self.qsilk_late_weighting,
                 self.qsilk_use_aqclip,
                 self.qsilk_tile_size,
                 self.qsilk_stride,
@@ -349,6 +383,12 @@ class GuidancePackScript(scripts.Script):
             self.micro_q_high = float(qsilk_xyz["micro_q_high"])
         if "micro_alpha" in qsilk_xyz:
             self.micro_alpha = float(qsilk_xyz["micro_alpha"])
+        if "micro_vp_mix" in qsilk_xyz:
+            self.qsilk_vp_mix = float(qsilk_xyz["micro_vp_mix"])
+        if "per_channel" in qsilk_xyz:
+            self.qsilk_per_channel = str(qsilk_xyz["per_channel"]).lower() == "true"
+        if "late_weighting" in qsilk_xyz:
+            self.qsilk_late_weighting = str(qsilk_xyz["late_weighting"]).lower() == "true"
         if "use_aqclip" in qsilk_xyz:
             self.qsilk_use_aqclip = str(qsilk_xyz["use_aqclip"]).lower() == "true"
         if "tile_size" in qsilk_xyz:
@@ -459,6 +499,9 @@ class GuidancePackScript(scripts.Script):
                     micro_q_low=self.micro_q_low,
                     micro_q_high=self.micro_q_high,
                     micro_alpha=self.micro_alpha,
+                    micro_vp_mix=self.qsilk_vp_mix,
+                    per_channel=self.qsilk_per_channel,
+                    enable_late_weighting=self.qsilk_late_weighting,
                     use_aqclip=self.qsilk_use_aqclip,
                     tile_size=int(self.qsilk_tile_size),
                     stride=int(self.qsilk_stride),
@@ -470,16 +513,22 @@ class GuidancePackScript(scripts.Script):
             p.extra_generation_params["QSilk micro_q_low"] = self.micro_q_low
             p.extra_generation_params["QSilk micro_q_high"] = self.micro_q_high
             p.extra_generation_params["QSilk micro_alpha"] = self.micro_alpha
+            p.extra_generation_params["QSilk micro_vp_mix"] = self.qsilk_vp_mix
+            p.extra_generation_params["QSilk per_channel"] = self.qsilk_per_channel
+            p.extra_generation_params["QSilk late_weighting"] = self.qsilk_late_weighting
             p.extra_generation_params["QSilk use_aqclip"] = self.qsilk_use_aqclip
             p.extra_generation_params["QSilk tile_size"] = int(self.qsilk_tile_size)
             p.extra_generation_params["QSilk stride"] = int(self.qsilk_stride)
             p.extra_generation_params["QSilk aqclip_alpha"] = self.qsilk_aqclip_alpha
             p.extra_generation_params["QSilk ema_beta"] = self.qsilk_ema_beta
             logging.debug(
-                "QSilk: Applied with micrograin (%s, %s, %s) and AQClip (%s, tile=%s, stride=%s, alpha=%s, ema=%s)",
+                "QSilk: Applied with micrograin (%s, %s, %s, vp=%s, per_channel=%s, late_weighting=%s) and AQClip (%s, tile=%s, stride=%s, alpha=%s, ema=%s)",
                 self.micro_q_low,
                 self.micro_q_high,
                 self.micro_alpha,
+                self.qsilk_vp_mix,
+                self.qsilk_per_channel,
+                self.qsilk_late_weighting,
                 self.qsilk_use_aqclip,
                 self.qsilk_tile_size,
                 self.qsilk_stride,
@@ -614,6 +663,23 @@ def make_guidance_axis_on_xyz_grid():
             label="(QSilk) micro_alpha",
             type=float,
             apply=partial(set_guidance_value, feature="qsilk", field="micro_alpha"),
+        ),
+        xyz_grid.AxisOption(
+            label="(QSilk) micro_vp_mix",
+            type=float,
+            apply=partial(set_guidance_value, feature="qsilk", field="micro_vp_mix"),
+        ),
+        xyz_grid.AxisOption(
+            label="(QSilk) per_channel",
+            type=str,
+            apply=partial(set_guidance_value, feature="qsilk", field="per_channel"),
+            choices=lambda: ["True", "False"],
+        ),
+        xyz_grid.AxisOption(
+            label="(QSilk) late_weighting",
+            type=str,
+            apply=partial(set_guidance_value, feature="qsilk", field="late_weighting"),
+            choices=lambda: ["True", "False"],
         ),
         xyz_grid.AxisOption(
             label="(QSilk) use_aqclip",

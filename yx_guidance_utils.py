@@ -52,43 +52,74 @@ def ensure_guidance_pipeline(model) -> GuidancePipeline:
     return model._guidance_pipeline
 
 
-def qsilk_micrograin(
-    x: torch.Tensor, q_low: float = 0.001, q_high: float = 0.999, alpha: float = 2.0, eps: float = 1e-8
-) -> torch.Tensor:
-    """Smooth per-sample clipping based on global quantiles.
+def _percentiles_per_sample(
+    x: torch.Tensor, q_low: float, q_high: float, per_channel: bool = False
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute per-sample (optionally per-channel) quantiles in FP32."""
 
-    Args:
-        x: Latent tensor with shape [B, C, H, W]. If dimensionality differs, the tensor is returned unchanged.
-        q_low: Lower quantile.
-        q_high: Upper quantile.
-        alpha: Tanh softness scale.
-        eps: Numerical stability term.
-
-    Returns:
-        Tensor with the same shape/dtype/device as ``x`` after smooth clipping.
-    """
-
-    if x.dim() != 4:
-        return x
-
-    dtype = x.dtype
-    device = x.device
     b = x.shape[0]
-    x_float = x.float()
-    flat = x_float.view(b, -1)
+    if per_channel and x.dim() >= 3:
+        flat = x.reshape(b, x.shape[1], -1).to(torch.float32)
+        l = torch.quantile(flat, q_low, dim=2)
+        h = torch.quantile(flat, q_high, dim=2)
+        shape = (b, x.shape[1]) + (1,) * (x.dim() - 2)
+    else:
+        flat = x.reshape(b, -1).to(torch.float32)
+        l = torch.quantile(flat, q_low, dim=1)
+        h = torch.quantile(flat, q_high, dim=1)
+        shape = (b,) + (1,) * (x.dim() - 1)
 
-    try:
-        quantiles = torch.quantile(flat, torch.tensor([q_low, q_high], device=device, dtype=x_float.dtype), dim=1)
-        l, h = quantiles[0], quantiles[1]
-    except Exception:
-        logging.warning("QSilk: torch.quantile unavailable; skipping micrograin stabilization this step.")
+    return l.view(shape), h.view(shape)
+
+
+def qsilk_micrograin(
+    x: torch.Tensor,
+    q_low: float = 0.001,
+    q_high: float = 0.999,
+    alpha: float = 2.0,
+    vp_mix: float = 0.15,
+    late_weight: Optional[float] = None,
+    per_channel: bool = False,
+) -> torch.Tensor:
+    """Tanh soft-clamp micrograin with optional VP-mix and late-step blending."""
+
+    if x.dim() < 2:
         return x
 
-    m = ((l + h) / 2).view(b, 1, 1, 1)
-    delta = ((h - l) / 2).view(b, 1, 1, 1)
-    normed = (x_float - m) / (delta + eps)
-    clipped = m + delta * torch.tanh(alpha * normed)
-    return clipped.to(dtype=dtype)
+    orig_dtype = x.dtype
+    use_per_channel = per_channel and x.dim() >= 3
+
+    x32 = x.to(torch.float32)
+    x32 = torch.nan_to_num(x32, nan=0.0, posinf=1e6, neginf=-1e6)
+
+    dims = tuple(range(2, x32.dim())) if use_per_channel else tuple(range(1, x32.dim()))
+
+    mu0 = x32.mean(dim=dims, keepdim=True)
+    var0 = x32.var(dim=dims, unbiased=False, keepdim=True)
+    std0 = torch.sqrt(var0 + 1e-6)
+
+    l, h = _percentiles_per_sample(x32, q_low, q_high, per_channel=use_per_channel)
+    m = 0.5 * (l + h)
+    delta = 0.5 * (h - l)
+
+    y = (x32 - m) / (delta + 1e-6)
+    x_soft = m + delta * torch.tanh(alpha * y)
+
+    mu1 = x_soft.mean(dim=dims, keepdim=True)
+    var1 = x_soft.var(dim=dims, unbiased=False, keepdim=True)
+    std1 = torch.sqrt(var1 + 1e-6)
+
+    y2 = (x_soft - mu1) / (std1 + 1e-6)
+    x_vp = y2 * std0 + mu0
+
+    mix = float(max(0.0, min(1.0, vp_mix)))
+    x_out = x_soft.lerp(x_vp, mix)
+
+    if late_weight is not None:
+        lw = float(max(0.0, min(1.0, late_weight)))
+        x_out = x32.lerp(x_out, lw)
+
+    return x_out.to(orig_dtype)
 
 
 def ndtri(q: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
@@ -178,7 +209,10 @@ def make_qsilk_modifier(
     micro_q_low: float = 0.001,
     micro_q_high: float = 0.999,
     micro_alpha: float = 2.0,
-    use_aqclip: bool = True,
+    micro_vp_mix: float = 0.15,
+    per_channel: bool = False,
+    enable_late_weighting: bool = True,
+    use_aqclip: bool = False,
     tile_size: int = 32,
     stride: int = 16,
     aqclip_alpha: float = 2.0,
@@ -186,10 +220,81 @@ def make_qsilk_modifier(
 ) -> Callable:
     ema_state: Dict[str, torch.Tensor] = {}
 
+    def _smoothstep(x: float, edge0: float = 0.35, edge1: float = 0.85) -> float:
+        t = (x - edge0) / (edge1 - edge0 + 1e-6)
+        t = max(0.0, min(1.0, t))
+        return t * t * (3.0 - 2.0 * t)
+
+    def _get_sigma_bounds(args) -> Tuple[Optional[float], Optional[float]]:
+        sigma_max_val = args.get("sigma_max")
+        sigma_min_val = args.get("sigma_min")
+
+        sigmas = args.get("sigmas")
+        if sigmas is not None:
+            try:
+                if torch.is_tensor(sigmas) and sigmas.numel() > 0:
+                    sigma_max_val = float(torch.max(sigmas).item())
+                    sigma_min_val = float(torch.min(sigmas).item())
+                elif isinstance(sigmas, (list, tuple)) and len(sigmas) > 0:
+                    sigma_max_val = float(max(sigmas))
+                    sigma_min_val = float(min(sigmas))
+            except Exception:
+                logging.debug("QSilk: Unable to derive sigma bounds from 'sigmas'.")
+
+        try:
+            sigma_max_val = float(sigma_max_val) if sigma_max_val is not None else None
+            sigma_min_val = float(sigma_min_val) if sigma_min_val is not None else None
+        except (TypeError, ValueError):
+            sigma_max_val, sigma_min_val = None, None
+
+        return sigma_max_val, sigma_min_val
+
+    def _compute_late_weight(args) -> Optional[float]:
+        if not enable_late_weighting:
+            return None
+
+        sigma_val = None
+        if "sigma" in args:
+            try:
+                sigma_raw = args["sigma"]
+                if torch.is_tensor(sigma_raw):
+                    sigma_val = float(sigma_raw.detach().view(-1)[0].item())
+                else:
+                    sigma_val = float(sigma_raw)
+            except Exception:
+                logging.debug("QSilk: Unable to parse sigma value for late weighting.")
+
+        sigma_max_val, sigma_min_val = _get_sigma_bounds(args)
+
+        if sigma_val is not None and sigma_max_val is not None and sigma_min_val is not None:
+            if sigma_max_val > sigma_min_val:
+                frac = 1.0 - (sigma_val - sigma_min_val) / (sigma_max_val - sigma_min_val + 1e-6)
+                return _smoothstep(frac)
+
+        step = args.get("step")
+        total_steps = args.get("total_steps") or args.get("steps")
+        try:
+            if step is not None and total_steps is not None:
+                frac = float(step) / max(float(total_steps), 1.0)
+                return _smoothstep(frac)
+        except Exception:
+            logging.debug("QSilk: Unable to compute step-based late weighting.")
+
+        return None
+
     def modifier(args, state: GuidanceState) -> GuidanceState:
         nonlocal ema_state
         pred = state.prediction
-        pred = qsilk_micrograin(pred, q_low=micro_q_low, q_high=micro_q_high, alpha=micro_alpha)
+        late_weight = _compute_late_weight(args)
+        pred = qsilk_micrograin(
+            pred,
+            q_low=micro_q_low,
+            q_high=micro_q_high,
+            alpha=micro_alpha,
+            vp_mix=micro_vp_mix,
+            late_weight=late_weight,
+            per_channel=per_channel,
+        )
 
         if use_aqclip:
             pred, ema_state = qsilk_aqclip_lite(
