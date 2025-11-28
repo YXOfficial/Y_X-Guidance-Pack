@@ -8,9 +8,12 @@ from modules import devices, shared
 
 try:
     import modules.sd_hijack_clip as sd_hijack_clip
-    import modules.sd_hijack_clip as sd_emphasis
 except Exception:
     sd_hijack_clip = None
+
+try:
+    import modules.sd_emphasis as sd_emphasis
+except Exception:
     sd_emphasis = None
 
 
@@ -157,13 +160,19 @@ def _encode_chunk_with_embeds(
     pooled = getattr(z, "pooled", None)
 
     emphasis = None
-    if sd_emphasis is not None:
-        get_emphasis = getattr(sd_emphasis, "get_current_option", None)
+    emphasis_module = sd_emphasis if sd_emphasis is not None else sd_hijack_clip
+    if emphasis_module is not None:
+        get_emphasis = getattr(emphasis_module, "get_current_option", None)
         if callable(get_emphasis):
             try:
                 emphasis = get_emphasis(shared.opts.emphasis)()
             except Exception:
                 logging.exception("TPSO: emphasis option resolution failed; continuing without emphasis")
+        elif emphasis_module is not None:
+            logging.debug(
+                "TPSO: emphasis helper not available on %s; skipping emphasis",
+                getattr(emphasis_module, "__name__", type(emphasis_module).__name__),
+            )
 
     if emphasis is not None:
         emphasis.tokens = token_lists
