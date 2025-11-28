@@ -268,6 +268,15 @@ def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) 
         attention_masks=attention_masks,
     )
 
+    embed_dim = getattr(embedding_layer, "embedding_dim", None)
+    if embed_dim is None:
+        weight = getattr(embedding_layer, "weight", None)
+        if weight is None:
+            logging.error("TPSO: embedding layer lacks weight and embedding_dim attributes")
+            raise RuntimeError("TPSO embedder resolution failed")
+        embed_dim = weight.shape[1]
+    weight_dtype = getattr(getattr(embedding_layer, "weight", None), "dtype", torch.float32)
+
     eps_params: List[List[torch.nn.Parameter]] = []
     for _ in range(config.num_variants):
         variant_params = []
@@ -276,9 +285,9 @@ def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) 
                 torch.randn(
                     attn_mask.shape[0],
                     attn_mask.shape[1],
-                    embedding_layer.embedding_dim,
+                    embed_dim,
                     device=devices.device,
-                    dtype=embedding_layer.weight.dtype,
+                    dtype=weight_dtype,
                 )
                 * 1e-4
             )
