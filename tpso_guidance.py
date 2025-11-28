@@ -156,7 +156,15 @@ def _encode_chunk_with_embeds(
 
     pooled = getattr(z, "pooled", None)
 
-    emphasis = sd_emphasis.get_current_option(shared.opts.emphasis)() if sd_emphasis else None
+    emphasis = None
+    if sd_emphasis is not None:
+        get_emphasis = getattr(sd_emphasis, "get_current_option", None)
+        if callable(get_emphasis):
+            try:
+                emphasis = get_emphasis(shared.opts.emphasis)()
+            except Exception:
+                logging.exception("TPSO: emphasis option resolution failed; continuing without emphasis")
+
     if emphasis is not None:
         emphasis.tokens = token_lists
         emphasis.multipliers = torch.asarray(multipliers).to(devices.device)
