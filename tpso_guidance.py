@@ -39,8 +39,28 @@ def _get_embedding_layer(clip_wrapper):
     return transformer.text_model.get_input_embeddings()
 
 
+def _resolve_clip_embedder(clip_wrapper):
+    if clip_wrapper is None:
+        return None
+
+    wrapped = getattr(clip_wrapper, "wrapped", None)
+    if hasattr(clip_wrapper, "encode_with_transformers") and wrapped is not None and hasattr(wrapped, "transformer"):
+        return clip_wrapper
+
+    embedders = getattr(clip_wrapper, "embedders", None)
+    if isinstance(embedders, (list, tuple)) and embedders:
+        for embedder in embedders:
+            wrapped = getattr(embedder, "wrapped", None)
+            if hasattr(embedder, "encode_with_transformers") and wrapped is not None and hasattr(wrapped, "transformer"):
+                return embedder
+        return embedders[0]
+
+    return None
+
+
 def _encode_chunk_with_embeds(
     clip_wrapper,
+    embedder,
     tokens_tensor: torch.Tensor,
     token_lists: Sequence[Sequence[int]],
     multipliers: Sequence[Sequence[float]],
@@ -48,54 +68,57 @@ def _encode_chunk_with_embeds(
     attention_mask: Optional[torch.Tensor] = None,
 ):
     # Adapted from FrozenCLIPEmbedderWithCustomWords.process_tokens but allows inputs_embeds.
-    if clip_wrapper.id_end != clip_wrapper.id_pad:
+    if embedder.id_end != embedder.id_pad:
         for batch_pos in range(tokens_tensor.shape[0]):
             token_row = tokens_tensor[batch_pos]
-            end_positions = (token_row == clip_wrapper.id_end).nonzero(as_tuple=False)
+            end_positions = (token_row == embedder.id_end).nonzero(as_tuple=False)
             if end_positions.numel() > 0:
                 index = end_positions[0, 0].item()
-                token_row[index + 1 :] = clip_wrapper.id_pad
+                token_row[index + 1 :] = embedder.id_pad
 
     if inputs_embeds is None:
-        z = clip_wrapper.encode_with_transformers(tokens_tensor)
+        z = embedder.encode_with_transformers(tokens_tensor)
     else:
-        transformer = clip_wrapper.wrapped.transformer
+        transformer = embedder.wrapped.transformer
         kwargs = {}
         if attention_mask is not None:
             kwargs["attention_mask"] = attention_mask
 
         # Mirror encode_with_transformers branches for supported clip wrappers
-        if hasattr(clip_wrapper, "minimal_clip_skip"):
+        outputs = None
+
+        if hasattr(embedder, "minimal_clip_skip"):
             outputs = transformer(
                 inputs_embeds=inputs_embeds,
                 output_hidden_states=-shared.opts.CLIP_stop_at_last_layers,
                 **kwargs,
             )
-            if shared.opts.CLIP_stop_at_last_layers > clip_wrapper.minimal_clip_skip:
+            if shared.opts.CLIP_stop_at_last_layers > embedder.minimal_clip_skip:
                 z = outputs.hidden_states[-shared.opts.CLIP_stop_at_last_layers]
                 z = transformer.text_model.final_layer_norm(z)
             else:
                 z = outputs.last_hidden_state
-        elif hasattr(clip_wrapper, "layer_idx"):
+        elif hasattr(embedder, "layer_idx"):
             outputs = transformer(
                 inputs_embeds=inputs_embeds,
                 output_hidden_states=True,
                 **kwargs,
             )
-            if shared.opts.CLIP_stop_at_last_layers > getattr(clip_wrapper, "minimal_clip_skip", 1):
+            if shared.opts.CLIP_stop_at_last_layers > getattr(embedder, "minimal_clip_skip", 1):
                 z = outputs.hidden_states[-shared.opts.CLIP_stop_at_last_layers]
                 z = transformer.text_model.final_layer_norm(z)
-            elif getattr(clip_wrapper.wrapped, "layer", "last") == "last":
+            elif getattr(embedder.wrapped, "layer", "last") == "last":
                 z = outputs.last_hidden_state
             else:
-                z = outputs.hidden_states[clip_wrapper.wrapped.layer_idx]
+                z = outputs.hidden_states[embedder.wrapped.layer_idx]
                 z = transformer.text_model.final_layer_norm(z)
         else:
             # Fallback to the transformer's default output
-            z = transformer(inputs_embeds=inputs_embeds, **kwargs).last_hidden_state
+            outputs = transformer(inputs_embeds=inputs_embeds, **kwargs)
+            z = outputs.last_hidden_state
 
         pooled_output = getattr(outputs, "pooler_output", None)
-        text_projection = getattr(clip_wrapper.wrapped, "text_projection", None)
+        text_projection = getattr(embedder.wrapped, "text_projection", None)
         if pooled_output is not None and text_projection is not None:
             pooled_output = pooled_output.float().to(text_projection.device) @ text_projection.float()
             z.pooled = pooled_output
@@ -127,6 +150,7 @@ def _build_embeddings_from_chunks(chunks: List[torch.Tensor]) -> torch.Tensor:
 
 def _collect_tpso_embeddings(
     clip_wrapper,
+    embedder,
     batch_chunks,
     embedding_layer,
     eps_params: Optional[List[List[torch.nn.Parameter]]],
@@ -144,6 +168,7 @@ def _collect_tpso_embeddings(
 
         encoded = _encode_chunk_with_embeds(
             clip_wrapper,
+            embedder,
             tokens,
             token_lists,
             multipliers,
@@ -164,21 +189,27 @@ def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) 
     if sd_hijack_clip is None:
         raise RuntimeError("TPSO dependencies are unavailable")
 
+    embedder = _resolve_clip_embedder(clip_wrapper)
+    if embedder is None or not hasattr(embedder, "wrapped"):
+        logging.error("TPSO: unable to resolve a compatible CLIP embedder from %s", type(clip_wrapper).__name__)
+        raise RuntimeError("TPSO embedder resolution failed")
+
     batch_chunks, _ = clip_wrapper.process_texts(prompts)
     chunk_count = max(len(x) for x in batch_chunks)
 
-    embedding_layer = _get_embedding_layer(clip_wrapper).to(devices.device)
+    embedding_layer = _get_embedding_layer(embedder).to(devices.device)
     attention_masks = []
     prepared_chunks = []
     for i in range(chunk_count):
         batch_chunk = [chunks[i] if i < len(chunks) else clip_wrapper.empty_chunk() for chunks in batch_chunks]
         tokens = torch.asarray([x.tokens for x in batch_chunk]).to(devices.device)
-        mask = (tokens != clip_wrapper.id_pad).long()
+        mask = (tokens != embedder.id_pad).long()
         attention_masks.append(mask)
         prepared_chunks.append(batch_chunk)
 
     pivot_embedding = _collect_tpso_embeddings(
         clip_wrapper,
+        embedder,
         prepared_chunks,
         embedding_layer,
         eps_params=None,
@@ -210,6 +241,7 @@ def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) 
             variant_embeddings.append(
                 _collect_tpso_embeddings(
                     clip_wrapper,
+                    embedder,
                     prepared_chunks,
                     embedding_layer,
                     eps_params=params,
@@ -258,6 +290,7 @@ def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) 
             final_variants.append(
                 _collect_tpso_embeddings(
                     clip_wrapper,
+                    embedder,
                     prepared_chunks,
                     embedding_layer,
                     eps_params=params,
