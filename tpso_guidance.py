@@ -129,6 +129,12 @@ def _encode_chunk_with_embeds(
         if hook_handle is not None:
             hook_handle.remove()
 
+    if offsets is not None:
+        try:
+            z = z + offsets.to(device=z.device, dtype=z.dtype)
+        except Exception:
+            logging.exception("TPSO: direct offset application failed")
+
     pooled = getattr(z, "pooled", None)
 
     emphasis = None
