@@ -130,10 +130,18 @@ def _encode_chunk_with_embeds(
             hook_handle.remove()
 
     if offsets is not None:
-        try:
-            z = z + offsets.to(device=z.device, dtype=z.dtype)
-        except Exception:
-            logging.exception("TPSO: direct offset application failed")
+        if offsets.shape[:2] != z.shape[:2]:
+            logging.error(
+                "TPSO: offset/text shape mismatch after encoding; offsets %s, encoded %s",
+                offsets.shape,
+                z.shape,
+            )
+            raise RuntimeError("TPSO offsets shape mismatch after encoding")
+
+        offsets_aligned = offsets
+        if offsets.shape != z.shape:
+            offsets_aligned = offsets.expand_as(z)
+        z = z + offsets_aligned.to(device=z.device, dtype=z.dtype)
 
     pooled = getattr(z, "pooled", None)
 
@@ -268,6 +276,7 @@ def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) 
                 )
                 * 1e-4
             )
+            eps.requires_grad_(True)
             variant_params.append(eps)
         eps_params.append(variant_params)
 
@@ -311,6 +320,9 @@ def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) 
                 diversity_loss = diversity_loss / max(count, 1)
 
             loss = semantic_loss + config.lambda_div * diversity_loss
+            if not loss.requires_grad:
+                logging.error("TPSO: loss is not connected to offsets; aborting optimization")
+                raise RuntimeError("TPSO loss graph is detached from offsets")
             loss.backward()
         optimizer.step()
 
