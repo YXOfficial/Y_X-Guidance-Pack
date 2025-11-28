@@ -95,10 +95,10 @@ def _encode_chunk_with_embeds(
     tokens_tensor: torch.Tensor,
     token_lists: Sequence[Sequence[int]],
     multipliers: Sequence[Sequence[float]],
-    inputs_embeds: Optional[torch.Tensor] = None,
-    attention_mask: Optional[torch.Tensor] = None,
+    embedding_layer,
+    offsets: Optional[torch.Tensor] = None,
 ):
-    # Adapted from FrozenCLIPEmbedderWithCustomWords.process_tokens but allows inputs_embeds.
+    # Adapted from FrozenCLIPEmbedderWithCustomWords.process_tokens but allows offsets via embedding hooks.
     if embedder.id_end != embedder.id_pad:
         for batch_pos in range(tokens_tensor.shape[0]):
             token_row = tokens_tensor[batch_pos]
@@ -107,55 +107,27 @@ def _encode_chunk_with_embeds(
                 index = end_positions[0, 0].item()
                 token_row[index + 1 :] = embedder.id_pad
 
-    transformer = _get_transformer(embedder)
-    if transformer is None and inputs_embeds is not None:
-        raise RuntimeError("TPSO: embedder transformer unavailable for inputs_embeds path")
-
-    if inputs_embeds is None:
-        z = embedder.encode_with_transformers(tokens_tensor)
-    else:
-        kwargs = {}
-        if attention_mask is not None:
-            kwargs["attention_mask"] = attention_mask
-
-        # Mirror encode_with_transformers branches for supported clip wrappers
-        outputs = None
-
-        if hasattr(embedder, "minimal_clip_skip"):
-            outputs = transformer(
-                inputs_embeds=inputs_embeds,
-                output_hidden_states=-shared.opts.CLIP_stop_at_last_layers,
-                **kwargs,
+    hook_handle = None
+    if offsets is not None:
+        if offsets.shape != (tokens_tensor.shape[0], tokens_tensor.shape[1], offsets.shape[-1]):
+            logging.debug(
+                "TPSO: offset shape mismatch, expected %s got %s", tokens_tensor.shape, offsets.shape
             )
-            if shared.opts.CLIP_stop_at_last_layers > embedder.minimal_clip_skip:
-                z = outputs.hidden_states[-shared.opts.CLIP_stop_at_last_layers]
-                z = transformer.text_model.final_layer_norm(z)
-            else:
-                z = outputs.last_hidden_state
-        elif hasattr(embedder, "layer_idx"):
-            outputs = transformer(
-                inputs_embeds=inputs_embeds,
-                output_hidden_states=True,
-                **kwargs,
-            )
-            if shared.opts.CLIP_stop_at_last_layers > getattr(embedder, "minimal_clip_skip", 1):
-                z = outputs.hidden_states[-shared.opts.CLIP_stop_at_last_layers]
-                z = transformer.text_model.final_layer_norm(z)
-            elif getattr(embedder.wrapped, "layer", "last") == "last":
-                z = outputs.last_hidden_state
-            else:
-                z = outputs.hidden_states[embedder.wrapped.layer_idx]
-                z = transformer.text_model.final_layer_norm(z)
         else:
-            # Fallback to the transformer's default output
-            outputs = transformer(inputs_embeds=inputs_embeds, **kwargs)
-            z = outputs.last_hidden_state
+            def _offset_hook(module, args, output):
+                try:
+                    return output + offsets
+                except Exception:
+                    logging.exception("TPSO: embedding offset hook failed")
+                    return output
 
-        pooled_output = getattr(outputs, "pooler_output", None)
-        text_projection = getattr(embedder.wrapped, "text_projection", None)
-        if pooled_output is not None and text_projection is not None:
-            pooled_output = pooled_output.float().to(text_projection.device) @ text_projection.float()
-            z.pooled = pooled_output
+            hook_handle = embedding_layer.register_forward_hook(_offset_hook)
+
+    try:
+        z = embedder.encode_with_transformers(tokens_tensor)
+    finally:
+        if hook_handle is not None:
+            hook_handle.remove()
 
     pooled = getattr(z, "pooled", None)
 
@@ -202,7 +174,6 @@ def _collect_tpso_embeddings(
     batch_chunks,
     embedding_layer,
     eps_params: Optional[List[List[torch.nn.Parameter]]],
-    attention_masks: List[torch.Tensor],
 ):
     chunk_outputs = []
     for idx, chunk in enumerate(batch_chunks):
@@ -210,9 +181,9 @@ def _collect_tpso_embeddings(
         multipliers = [x.multipliers for x in chunk]
         token_lists = [x.tokens for x in chunk]
 
-        inputs_embeds = None
+        offsets = None
         if eps_params is not None:
-            inputs_embeds = embedding_layer(tokens) + eps_params[idx]
+            offsets = eps_params[idx]
 
         encoded = _encode_chunk_with_embeds(
             clip_wrapper,
@@ -220,8 +191,8 @@ def _collect_tpso_embeddings(
             tokens,
             token_lists,
             multipliers,
-            inputs_embeds=inputs_embeds,
-            attention_mask=attention_masks[idx],
+            embedding_layer,
+            offsets=offsets,
         )
         chunk_outputs.append(encoded)
 
@@ -265,7 +236,6 @@ def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) 
         prepared_chunks,
         embedding_layer,
         eps_params=None,
-        attention_masks=attention_masks,
     )
 
     embed_dim = getattr(embedding_layer, "embedding_dim", None)
@@ -306,7 +276,6 @@ def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) 
                     prepared_chunks,
                     embedding_layer,
                     eps_params=params,
-                    attention_masks=attention_masks,
                 )
             )
 
@@ -355,7 +324,6 @@ def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) 
                     prepared_chunks,
                     embedding_layer,
                     eps_params=params,
-                    attention_masks=attention_masks,
                 )
             )
 
