@@ -16,6 +16,7 @@ from nodes_cfg_zero import CFGZeroNode
 from nodes_fdg import FDGNode
 from nodes_zeresfdg import ZeResFDGNode
 from nodes_s2_guidance import S2GuidanceNode
+from tpso_guidance import TPSOConfig, make_tpso_conditioning_modifier, optimize_tpso_offsets
 
 
 class GuidancePackScript(scripts.Script):
@@ -54,6 +55,15 @@ class GuidancePackScript(scripts.Script):
         self.qsilk_stride = 16
         self.qsilk_aqclip_alpha = 2.0
         self.qsilk_ema_beta = 0.8
+
+        self.tpso_enabled = False
+        self.tpso_num_variants = 4
+        self.tpso_kappa = 0.80
+        self.tpso_sigma = 0.01
+        self.tpso_lambda_div = 5.0
+        self.tpso_r_ratio = 0.4
+        self.tpso_num_opt_steps = 30
+        self.tpso_lr = 1e-2
 
         self.cfg_zero_node = CFGZeroNode()
         self.fdg_node = FDGNode()
@@ -211,6 +221,59 @@ class GuidancePackScript(scripts.Script):
                         value=self.qsilk_ema_beta,
                     )
 
+                with gr.Tab(label="TPSO"):
+                    gr.Markdown("Training-free Token–Prompt Space Optimization (TPSO).")
+                    tpso_enabled = gr.Checkbox(label="Enable TPSO", value=self.tpso_enabled)
+                    tpso_num_variants = gr.Slider(
+                        label="Number of Variants",
+                        minimum=1,
+                        maximum=8,
+                        step=1,
+                        value=self.tpso_num_variants,
+                    )
+                    tpso_kappa = gr.Slider(
+                        label="κ (Semantic Target)",
+                        minimum=0.0,
+                        maximum=1.0,
+                        step=0.01,
+                        value=self.tpso_kappa,
+                    )
+                    tpso_sigma = gr.Slider(
+                        label="σ (Tolerance)",
+                        minimum=0.0,
+                        maximum=0.2,
+                        step=0.001,
+                        value=self.tpso_sigma,
+                    )
+                    tpso_lambda_div = gr.Slider(
+                        label="λ_div (Diversity Weight)",
+                        minimum=0.0,
+                        maximum=10.0,
+                        step=0.1,
+                        value=self.tpso_lambda_div,
+                    )
+                    tpso_r_ratio = gr.Slider(
+                        label="r ratio (Blend Window)",
+                        minimum=0.05,
+                        maximum=1.0,
+                        step=0.05,
+                        value=self.tpso_r_ratio,
+                    )
+                    tpso_num_opt_steps = gr.Slider(
+                        label="Optimization Steps",
+                        minimum=1,
+                        maximum=100,
+                        step=1,
+                        value=self.tpso_num_opt_steps,
+                    )
+                    tpso_lr = gr.Slider(
+                        label="Learning Rate",
+                        minimum=1e-4,
+                        maximum=5e-2,
+                        step=1e-4,
+                        value=self.tpso_lr,
+                    )
+
         cfg_zero_enabled.change(lambda x: setattr(self, "cfg_zero_enabled", x), inputs=[cfg_zero_enabled], outputs=None)
         zero_init_first_step.change(
             lambda x: setattr(self, "zero_init_first_step", x), inputs=[zero_init_first_step], outputs=None
@@ -261,6 +324,19 @@ class GuidancePackScript(scripts.Script):
         )
         qsilk_ema_beta.change(lambda x: setattr(self, "qsilk_ema_beta", x), inputs=[qsilk_ema_beta], outputs=None)
 
+        tpso_enabled.change(lambda x: setattr(self, "tpso_enabled", x), inputs=[tpso_enabled], outputs=None)
+        tpso_num_variants.change(
+            lambda x: setattr(self, "tpso_num_variants", x), inputs=[tpso_num_variants], outputs=None
+        )
+        tpso_kappa.change(lambda x: setattr(self, "tpso_kappa", x), inputs=[tpso_kappa], outputs=None)
+        tpso_sigma.change(lambda x: setattr(self, "tpso_sigma", x), inputs=[tpso_sigma], outputs=None)
+        tpso_lambda_div.change(lambda x: setattr(self, "tpso_lambda_div", x), inputs=[tpso_lambda_div], outputs=None)
+        tpso_r_ratio.change(lambda x: setattr(self, "tpso_r_ratio", x), inputs=[tpso_r_ratio], outputs=None)
+        tpso_num_opt_steps.change(
+            lambda x: setattr(self, "tpso_num_opt_steps", x), inputs=[tpso_num_opt_steps], outputs=None
+        )
+        tpso_lr.change(lambda x: setattr(self, "tpso_lr", x), inputs=[tpso_lr], outputs=None)
+
         self.ui_controls = [
             cfg_zero_enabled,
             zero_init_first_step,
@@ -291,6 +367,14 @@ class GuidancePackScript(scripts.Script):
             qsilk_stride,
             qsilk_aqclip_alpha,
             qsilk_ema_beta,
+            tpso_enabled,
+            tpso_num_variants,
+            tpso_kappa,
+            tpso_sigma,
+            tpso_lambda_div,
+            tpso_r_ratio,
+            tpso_num_opt_steps,
+            tpso_lr,
         ]
         return self.ui_controls
 
@@ -327,6 +411,14 @@ class GuidancePackScript(scripts.Script):
                 self.qsilk_stride,
                 self.qsilk_aqclip_alpha,
                 self.qsilk_ema_beta,
+                self.tpso_enabled,
+                self.tpso_num_variants,
+                self.tpso_kappa,
+                self.tpso_sigma,
+                self.tpso_lambda_div,
+                self.tpso_r_ratio,
+                self.tpso_num_opt_steps,
+                self.tpso_lr,
             ) = args[:expected_args]
         else:
             logging.warning("Guidance Pack: Not enough arguments provided from UI.")
@@ -399,6 +491,24 @@ class GuidancePackScript(scripts.Script):
             self.qsilk_aqclip_alpha = float(qsilk_xyz["aqclip_alpha"])
         if "ema_beta" in qsilk_xyz:
             self.qsilk_ema_beta = float(qsilk_xyz["ema_beta"])
+
+        tpso_xyz = xyz_settings.get("tpso", {})
+        if "tpso_enabled" in tpso_xyz:
+            self.tpso_enabled = str(tpso_xyz["tpso_enabled"]).lower() == "true"
+        if "num_variants" in tpso_xyz:
+            self.tpso_num_variants = int(tpso_xyz["num_variants"])
+        if "kappa" in tpso_xyz:
+            self.tpso_kappa = float(tpso_xyz["kappa"])
+        if "sigma" in tpso_xyz:
+            self.tpso_sigma = float(tpso_xyz["sigma"])
+        if "lambda_div" in tpso_xyz:
+            self.tpso_lambda_div = float(tpso_xyz["lambda_div"])
+        if "r_ratio" in tpso_xyz:
+            self.tpso_r_ratio = float(tpso_xyz["r_ratio"])
+        if "opt_steps" in tpso_xyz:
+            self.tpso_num_opt_steps = int(tpso_xyz["opt_steps"])
+        if "lr" in tpso_xyz:
+            self.tpso_lr = float(tpso_xyz["lr"])
 
         restored = reset_unet_if_needed(p)
         if restored:
@@ -538,6 +648,40 @@ class GuidancePackScript(scripts.Script):
         elif pipeline is not None and "qsilk" in pipeline.modifiers:
             pipeline.modifiers.pop("qsilk", None)
 
+        if self.tpso_enabled:
+            try:
+                tpso_config = TPSOConfig(
+                    enabled=self.tpso_enabled,
+                    num_variants=int(self.tpso_num_variants),
+                    kappa=float(self.tpso_kappa),
+                    sigma=float(self.tpso_sigma),
+                    lambda_div=float(self.tpso_lambda_div),
+                    r_ratio=float(self.tpso_r_ratio),
+                    num_opt_steps=int(self.tpso_num_opt_steps),
+                    lr=float(self.tpso_lr),
+                )
+                pivot, variants = optimize_tpso_offsets(p.sd_model.cond_stage_model, p.all_prompts, tpso_config)
+                tpso_modifier = make_tpso_conditioning_modifier(pivot, variants, tpso_config, p.steps)
+                p.sd_model.forge_objects.unet.add_conditioning_modifier(tpso_modifier, ensure_uniqueness=True)
+                p.extra_generation_params["TPSO Enabled"] = self.tpso_enabled
+                p.extra_generation_params["TPSO Variants"] = int(self.tpso_num_variants)
+                p.extra_generation_params["TPSO κ"] = float(self.tpso_kappa)
+                p.extra_generation_params["TPSO σ"] = float(self.tpso_sigma)
+                p.extra_generation_params["TPSO λ_div"] = float(self.tpso_lambda_div)
+                p.extra_generation_params["TPSO r_ratio"] = float(self.tpso_r_ratio)
+                p.extra_generation_params["TPSO Steps"] = int(self.tpso_num_opt_steps)
+                p.extra_generation_params["TPSO lr"] = float(self.tpso_lr)
+                logging.info(
+                    "TPSO enabled with %s variants, κ=%.3f, σ=%.3f, λ=%.2f, r_ratio=%.2f",
+                    self.tpso_num_variants,
+                    self.tpso_kappa,
+                    self.tpso_sigma,
+                    self.tpso_lambda_div,
+                    self.tpso_r_ratio,
+                )
+            except Exception:
+                logging.exception("TPSO setup failed; proceeding without TPSO")
+
         return
 
 
@@ -557,7 +701,7 @@ def make_guidance_axis_on_xyz_grid():
     if xyz_grid is None:
         return
 
-    prefixes = ["(CFG-Zero)", "(FDG)", "(ZeResFDG)", "(S2-Guidance)", "(QSilk)"]
+    prefixes = ["(CFG-Zero)", "(FDG)", "(ZeResFDG)", "(S2-Guidance)", "(QSilk)", "(TPSO)"]
     if any(opt.label.startswith(prefix) for opt in xyz_grid.axis_options for prefix in prefixes):
         return
 
@@ -706,6 +850,47 @@ def make_guidance_axis_on_xyz_grid():
             label="(QSilk) ema_beta",
             type=float,
             apply=partial(set_guidance_value, feature="qsilk", field="ema_beta"),
+        ),
+        xyz_grid.AxisOption(
+            label="(TPSO) Enabled",
+            type=str,
+            apply=partial(set_guidance_value, feature="tpso", field="tpso_enabled"),
+            choices=lambda: ["True", "False"],
+        ),
+        xyz_grid.AxisOption(
+            label="(TPSO) num_variants",
+            type=int,
+            apply=partial(set_guidance_value, feature="tpso", field="num_variants"),
+        ),
+        xyz_grid.AxisOption(
+            label="(TPSO) kappa",
+            type=float,
+            apply=partial(set_guidance_value, feature="tpso", field="kappa"),
+        ),
+        xyz_grid.AxisOption(
+            label="(TPSO) sigma",
+            type=float,
+            apply=partial(set_guidance_value, feature="tpso", field="sigma"),
+        ),
+        xyz_grid.AxisOption(
+            label="(TPSO) lambda_div",
+            type=float,
+            apply=partial(set_guidance_value, feature="tpso", field="lambda_div"),
+        ),
+        xyz_grid.AxisOption(
+            label="(TPSO) r_ratio",
+            type=float,
+            apply=partial(set_guidance_value, feature="tpso", field="r_ratio"),
+        ),
+        xyz_grid.AxisOption(
+            label="(TPSO) opt_steps",
+            type=int,
+            apply=partial(set_guidance_value, feature="tpso", field="opt_steps"),
+        ),
+        xyz_grid.AxisOption(
+            label="(TPSO) lr",
+            type=float,
+            apply=partial(set_guidance_value, feature="tpso", field="lr"),
         ),
     ]
     xyz_grid.axis_options.extend(options)

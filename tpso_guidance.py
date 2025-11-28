@@ -1,0 +1,351 @@
+import logging
+from dataclasses import dataclass
+from typing import List, Optional, Sequence, Tuple
+
+import torch
+import torch.nn.functional as F
+from modules import devices, shared
+
+try:
+    import modules.sd_hijack_clip as sd_hijack_clip
+    import modules.sd_hijack_clip as sd_emphasis
+except Exception:
+    sd_hijack_clip = None
+    sd_emphasis = None
+
+
+@dataclass
+class TPSEmbedding:
+    cross_attn: torch.Tensor
+    pooled: Optional[torch.Tensor] = None
+
+
+@dataclass
+class TPSOConfig:
+    enabled: bool = False
+    num_variants: int = 4
+    kappa: float = 0.80
+    sigma: float = 0.01
+    lambda_div: float = 5.0
+    r_ratio: float = 0.4
+    num_opt_steps: int = 30
+    lr: float = 1e-2
+
+
+def _get_embedding_layer(clip_wrapper):
+    transformer = clip_wrapper.wrapped.transformer
+    if hasattr(transformer, "get_input_embeddings"):
+        return transformer.get_input_embeddings()
+    return transformer.text_model.get_input_embeddings()
+
+
+def _encode_chunk_with_embeds(
+    clip_wrapper,
+    tokens_tensor: torch.Tensor,
+    token_lists: Sequence[Sequence[int]],
+    multipliers: Sequence[Sequence[float]],
+    inputs_embeds: Optional[torch.Tensor] = None,
+    attention_mask: Optional[torch.Tensor] = None,
+):
+    # Adapted from FrozenCLIPEmbedderWithCustomWords.process_tokens but allows inputs_embeds.
+    if clip_wrapper.id_end != clip_wrapper.id_pad:
+        for batch_pos in range(tokens_tensor.shape[0]):
+            token_row = tokens_tensor[batch_pos]
+            end_positions = (token_row == clip_wrapper.id_end).nonzero(as_tuple=False)
+            if end_positions.numel() > 0:
+                index = end_positions[0, 0].item()
+                token_row[index + 1 :] = clip_wrapper.id_pad
+
+    if inputs_embeds is None:
+        z = clip_wrapper.encode_with_transformers(tokens_tensor)
+    else:
+        transformer = clip_wrapper.wrapped.transformer
+        kwargs = {}
+        if attention_mask is not None:
+            kwargs["attention_mask"] = attention_mask
+
+        # Mirror encode_with_transformers branches for supported clip wrappers
+        if hasattr(clip_wrapper, "minimal_clip_skip"):
+            outputs = transformer(
+                inputs_embeds=inputs_embeds,
+                output_hidden_states=-shared.opts.CLIP_stop_at_last_layers,
+                **kwargs,
+            )
+            if shared.opts.CLIP_stop_at_last_layers > clip_wrapper.minimal_clip_skip:
+                z = outputs.hidden_states[-shared.opts.CLIP_stop_at_last_layers]
+                z = transformer.text_model.final_layer_norm(z)
+            else:
+                z = outputs.last_hidden_state
+        elif hasattr(clip_wrapper, "layer_idx"):
+            outputs = transformer(
+                inputs_embeds=inputs_embeds,
+                output_hidden_states=True,
+                **kwargs,
+            )
+            if shared.opts.CLIP_stop_at_last_layers > getattr(clip_wrapper, "minimal_clip_skip", 1):
+                z = outputs.hidden_states[-shared.opts.CLIP_stop_at_last_layers]
+                z = transformer.text_model.final_layer_norm(z)
+            elif getattr(clip_wrapper.wrapped, "layer", "last") == "last":
+                z = outputs.last_hidden_state
+            else:
+                z = outputs.hidden_states[clip_wrapper.wrapped.layer_idx]
+                z = transformer.text_model.final_layer_norm(z)
+        else:
+            # Fallback to the transformer's default output
+            z = transformer(inputs_embeds=inputs_embeds, **kwargs).last_hidden_state
+
+        pooled_output = getattr(outputs, "pooler_output", None)
+        text_projection = getattr(clip_wrapper.wrapped, "text_projection", None)
+        if pooled_output is not None and text_projection is not None:
+            pooled_output = pooled_output.float().to(text_projection.device) @ text_projection.float()
+            z.pooled = pooled_output
+
+    pooled = getattr(z, "pooled", None)
+
+    emphasis = sd_emphasis.get_current_option(shared.opts.emphasis)() if sd_emphasis else None
+    if emphasis is not None:
+        emphasis.tokens = token_lists
+        emphasis.multipliers = torch.asarray(multipliers).to(devices.device)
+        emphasis.z = z
+        emphasis.after_transformers()
+        z = emphasis.z
+        if pooled is not None:
+            z.pooled = pooled
+
+    return z
+
+
+def _embedding_representation(embedding: TPSEmbedding) -> torch.Tensor:
+    if embedding.pooled is not None:
+        return embedding.pooled
+    return embedding.cross_attn.mean(dim=1)
+
+
+def _build_embeddings_from_chunks(chunks: List[torch.Tensor]) -> torch.Tensor:
+    return torch.hstack(chunks) if len(chunks) > 1 else chunks[0]
+
+
+def _collect_tpso_embeddings(
+    clip_wrapper,
+    batch_chunks,
+    embedding_layer,
+    eps_params: Optional[List[List[torch.nn.Parameter]]],
+    attention_masks: List[torch.Tensor],
+):
+    chunk_outputs = []
+    for idx, chunk in enumerate(batch_chunks):
+        tokens = torch.asarray([x.tokens for x in chunk]).to(devices.device)
+        multipliers = [x.multipliers for x in chunk]
+        token_lists = [x.tokens for x in chunk]
+
+        inputs_embeds = None
+        if eps_params is not None:
+            inputs_embeds = embedding_layer(tokens) + eps_params[idx]
+
+        encoded = _encode_chunk_with_embeds(
+            clip_wrapper,
+            tokens,
+            token_lists,
+            multipliers,
+            inputs_embeds=inputs_embeds,
+            attention_mask=attention_masks[idx],
+        )
+        chunk_outputs.append(encoded)
+
+    pooled = getattr(chunk_outputs[0], "pooled", None) if chunk_outputs else None
+    cross = _build_embeddings_from_chunks(chunk_outputs)
+    return TPSEmbedding(cross_attn=cross, pooled=pooled)
+
+
+def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) -> Tuple[TPSEmbedding, List[TPSEmbedding]]:
+    if not config.enabled:
+        raise RuntimeError("TPSO is disabled in configuration.")
+
+    if sd_hijack_clip is None:
+        raise RuntimeError("TPSO dependencies are unavailable")
+
+    batch_chunks, _ = clip_wrapper.process_texts(prompts)
+    chunk_count = max(len(x) for x in batch_chunks)
+
+    embedding_layer = _get_embedding_layer(clip_wrapper).to(devices.device)
+    attention_masks = []
+    prepared_chunks = []
+    for i in range(chunk_count):
+        batch_chunk = [chunks[i] if i < len(chunks) else clip_wrapper.empty_chunk() for chunks in batch_chunks]
+        tokens = torch.asarray([x.tokens for x in batch_chunk]).to(devices.device)
+        mask = (tokens != clip_wrapper.id_pad).long()
+        attention_masks.append(mask)
+        prepared_chunks.append(batch_chunk)
+
+    pivot_embedding = _collect_tpso_embeddings(
+        clip_wrapper,
+        prepared_chunks,
+        embedding_layer,
+        eps_params=None,
+        attention_masks=attention_masks,
+    )
+
+    eps_params: List[List[torch.nn.Parameter]] = []
+    for _ in range(config.num_variants):
+        variant_params = []
+        for attn_mask in attention_masks:
+            eps = torch.nn.Parameter(
+                torch.randn(
+                    attn_mask.shape[0],
+                    attn_mask.shape[1],
+                    embedding_layer.embedding_dim,
+                    device=devices.device,
+                    dtype=embedding_layer.weight.dtype,
+                )
+                * 1e-4
+            )
+            variant_params.append(eps)
+        eps_params.append(variant_params)
+
+    optimizer = torch.optim.Adam([p for params in eps_params for p in params], lr=config.lr)
+
+    for step in range(config.num_opt_steps):
+        variant_embeddings: List[TPSEmbedding] = []
+        for params in eps_params:
+            variant_embeddings.append(
+                _collect_tpso_embeddings(
+                    clip_wrapper,
+                    prepared_chunks,
+                    embedding_layer,
+                    eps_params=params,
+                    attention_masks=attention_masks,
+                )
+            )
+
+        pivot_repr = _embedding_representation(pivot_embedding)
+        variant_reprs = [_embedding_representation(v) for v in variant_embeddings]
+
+        semantic_loss = 0.0
+        for repr_k in variant_reprs:
+            cos_vals = F.cosine_similarity(pivot_repr, repr_k, dim=1)
+            mean_cos = cos_vals.mean()
+            semantic_loss = semantic_loss + torch.clamp(torch.abs(mean_cos - config.kappa) - config.sigma, min=0.0)
+
+        diversity_loss = 0.0
+        n = len(variant_reprs)
+        if n > 1:
+            count = 0
+            for i in range(n):
+                for j in range(n):
+                    if i == j:
+                        continue
+                    cos_vals = F.cosine_similarity(variant_reprs[i], variant_reprs[j], dim=1)
+                    diversity_loss = diversity_loss + cos_vals.mean()
+                    count += 1
+            diversity_loss = diversity_loss / max(count, 1)
+
+        loss = semantic_loss + config.lambda_div * diversity_loss
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        logging.debug(
+            "TPSO step %s: semantic=%.4f, diversity=%.4f, total=%.4f",
+            step + 1,
+            float(semantic_loss.detach().cpu()),
+            float(diversity_loss.detach().cpu()),
+            float(loss.detach().cpu()),
+        )
+
+    final_variants: List[TPSEmbedding] = []
+    with torch.no_grad():
+        for params in eps_params:
+            final_variants.append(
+                _collect_tpso_embeddings(
+                    clip_wrapper,
+                    prepared_chunks,
+                    embedding_layer,
+                    eps_params=params,
+                    attention_masks=attention_masks,
+                )
+            )
+
+    _log_tpso_stats(pivot_embedding, final_variants)
+    return pivot_embedding, final_variants
+
+
+def _log_tpso_stats(pivot: TPSEmbedding, variants: List[TPSEmbedding]):
+    try:
+        pivot_repr = _embedding_representation(pivot)
+        variant_reprs = [_embedding_representation(v) for v in variants]
+
+        sims = [
+            float(F.cosine_similarity(pivot_repr, vk, dim=1).mean().detach().cpu()) for vk in variant_reprs
+        ]
+        logging.info("TPSO semantic similarities vs pivot: %s", sims)
+
+        pairwise = []
+        for i in range(len(variant_reprs)):
+            for j in range(i + 1, len(variant_reprs)):
+                cos_vals = F.cosine_similarity(variant_reprs[i], variant_reprs[j], dim=1)
+                pairwise.append(float(cos_vals.mean().detach().cpu()))
+        logging.info("TPSO pairwise variant cosine similarities: %s", pairwise)
+    except Exception:
+        logging.exception("TPSO stats logging failed")
+
+
+def compute_alpha(step_index: int, total_steps: int, r_ratio: float) -> float:
+    if total_steps <= 0:
+        return 0.0
+    clamp_r = max(1e-6, min(1.0, r_ratio))
+    t0 = int((1.0 - clamp_r) * total_steps)
+    if step_index < t0:
+        return 0.0
+    alpha = (step_index - t0) / (clamp_r * total_steps)
+    return float(max(0.0, min(1.0, alpha)))
+
+
+def blend_embeddings(pivot: TPSEmbedding, variant: TPSEmbedding, alpha: float) -> TPSEmbedding:
+    alpha_tensor = torch.tensor(alpha, device=pivot.cross_attn.device, dtype=pivot.cross_attn.dtype)
+    cross = pivot.cross_attn.lerp(variant.cross_attn, alpha_tensor)
+    pooled = None
+    if pivot.pooled is not None and variant.pooled is not None:
+        pooled = pivot.pooled.lerp(variant.pooled, alpha_tensor)
+    return TPSEmbedding(cross_attn=cross, pooled=pooled)
+
+
+
+def make_tpso_conditioning_modifier(
+    pivot: TPSEmbedding,
+    variants: List[TPSEmbedding],
+    config: TPSOConfig,
+    total_steps: int,
+):
+    try:
+        from ldm_patched.modules.conds import CONDCrossAttn, CONDRegular
+    except Exception:
+        CONDCrossAttn = None
+        CONDRegular = None
+
+    step_state = {"i": 0}
+    variant_choice = variants[0] if variants else pivot
+
+    def modifier(model, x, timestep, uncond, cond, cond_scale, model_options, seed):
+        alpha = compute_alpha(step_state["i"], total_steps, config.r_ratio)
+        step_state["i"] += 1
+        if alpha <= 0.0 or CONDCrossAttn is None or cond is None:
+            return model, x, timestep, uncond, cond, cond_scale, model_options, seed
+
+        blended = blend_embeddings(pivot, variant_choice, alpha)
+
+        for entry in cond:
+            entry_cross = entry.get("cross_attn")
+            if entry_cross is not None:
+                entry_cross = blended.cross_attn.to(device=entry_cross.device, dtype=entry_cross.dtype)
+                entry["cross_attn"] = entry_cross
+                if "model_conds" in entry and "c_crossattn" in entry["model_conds"]:
+                    entry["model_conds"]["c_crossattn"] = CONDCrossAttn(entry_cross)
+            if blended.pooled is not None and "model_conds" in entry and entry_cross is not None:
+                pooled_target = entry["model_conds"].get("y") or entry["model_conds"].get("c_crossattn")
+                device = getattr(pooled_target, "cond", entry_cross).device if pooled_target is not None else entry_cross.device
+                pooled_tensor = blended.pooled.to(device=device)
+                entry["model_conds"]["y"] = CONDRegular(pooled_tensor)
+                entry["pooled_output"] = pooled_tensor
+        return model, x, timestep, uncond, cond, cond_scale, model_options, seed
+
+    return modifier
