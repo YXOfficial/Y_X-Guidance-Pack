@@ -1,6 +1,6 @@
 import logging
 from dataclasses import dataclass
-from typing import List, Optional, Sequence, Tuple
+from typing import Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -32,29 +32,57 @@ class TPSOConfig:
     lr: float = 1e-2
 
 
-def _get_embedding_layer(clip_wrapper):
-    transformer = clip_wrapper.wrapped.transformer
-    if hasattr(transformer, "get_input_embeddings"):
-        return transformer.get_input_embeddings()
-    return transformer.text_model.get_input_embeddings()
+def _get_transformer(embedder):
+    wrapped = getattr(embedder, "wrapped", None)
+    if wrapped is None:
+        return None
+    return getattr(wrapped, "transformer", None)
+
+
+def _get_embedding_layer(embedder):
+    wrapped = getattr(embedder, "wrapped", None)
+    if wrapped is None:
+        return None
+
+    transformer = getattr(wrapped, "transformer", None)
+    if transformer is not None:
+        if hasattr(transformer, "get_input_embeddings"):
+            return transformer.get_input_embeddings()
+        text_model = getattr(transformer, "text_model", None)
+        if text_model is not None and hasattr(text_model, "get_input_embeddings"):
+            return text_model.get_input_embeddings()
+
+    token_embedding = getattr(getattr(wrapped, "model", None), "token_embedding", None)
+    if token_embedding is not None:
+        return getattr(token_embedding, "wrapped", token_embedding)
+
+    return None
 
 
 def _resolve_clip_embedder(clip_wrapper):
     if clip_wrapper is None:
         return None
 
+    candidates: List = []
+
     wrapped = getattr(clip_wrapper, "wrapped", None)
-    if hasattr(clip_wrapper, "encode_with_transformers") and wrapped is not None and hasattr(wrapped, "transformer"):
-        return clip_wrapper
+    if hasattr(clip_wrapper, "encode_with_transformers") and wrapped is not None:
+        candidates.append(clip_wrapper)
 
     embedders = getattr(clip_wrapper, "embedders", None)
-    if isinstance(embedders, (list, tuple)) and embedders:
-        for embedder in embedders:
-            wrapped = getattr(embedder, "wrapped", None)
-            if hasattr(embedder, "encode_with_transformers") and wrapped is not None and hasattr(wrapped, "transformer"):
-                return embedder
-        return embedders[0]
+    if embedders is not None:
+        if isinstance(embedders, Iterable):
+            candidates.extend(list(embedders))
 
+    for embedder in candidates:
+        transformer = _get_transformer(embedder)
+        embedding_layer = _get_embedding_layer(embedder)
+        if hasattr(embedder, "encode_with_transformers") and transformer is not None and embedding_layer is not None:
+            return embedder
+
+    logging.error(
+        "TPSO: unable to resolve a compatible CLIP embedder from %s", type(clip_wrapper).__name__
+    )
     return None
 
 
@@ -76,10 +104,13 @@ def _encode_chunk_with_embeds(
                 index = end_positions[0, 0].item()
                 token_row[index + 1 :] = embedder.id_pad
 
+    transformer = _get_transformer(embedder)
+    if transformer is None and inputs_embeds is not None:
+        raise RuntimeError("TPSO: embedder transformer unavailable for inputs_embeds path")
+
     if inputs_embeds is None:
         z = embedder.encode_with_transformers(tokens_tensor)
     else:
-        transformer = embedder.wrapped.transformer
         kwargs = {}
         if attention_mask is not None:
             kwargs["attention_mask"] = attention_mask
@@ -197,7 +228,11 @@ def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) 
     batch_chunks, _ = clip_wrapper.process_texts(prompts)
     chunk_count = max(len(x) for x in batch_chunks)
 
-    embedding_layer = _get_embedding_layer(embedder).to(devices.device)
+    embedding_layer = _get_embedding_layer(embedder)
+    if embedding_layer is None:
+        logging.error("TPSO: no embedding layer available on %s", type(embedder).__name__)
+        raise RuntimeError("TPSO embedder resolution failed")
+    embedding_layer = embedding_layer.to(devices.device)
     attention_masks = []
     prepared_chunks = []
     for i in range(chunk_count):
