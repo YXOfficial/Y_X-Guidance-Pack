@@ -230,13 +230,14 @@ def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) 
         attention_masks.append(mask)
         prepared_chunks.append(batch_chunk)
 
-    pivot_embedding = _collect_tpso_embeddings(
-        clip_wrapper,
-        embedder,
-        prepared_chunks,
-        embedding_layer,
-        eps_params=None,
-    )
+    with torch.no_grad():
+        pivot_embedding = _collect_tpso_embeddings(
+            clip_wrapper,
+            embedder,
+            prepared_chunks,
+            embedding_layer,
+            eps_params=None,
+        )
 
     embed_dim = getattr(embedding_layer, "embedding_dim", None)
     if embed_dim is None:
@@ -267,43 +268,44 @@ def optimize_tpso_offsets(clip_wrapper, prompts: List[str], config: TPSOConfig) 
     optimizer = torch.optim.Adam([p for params in eps_params for p in params], lr=config.lr)
 
     for step in range(config.num_opt_steps):
-        variant_embeddings: List[TPSEmbedding] = []
-        for params in eps_params:
-            variant_embeddings.append(
-                _collect_tpso_embeddings(
-                    clip_wrapper,
-                    embedder,
-                    prepared_chunks,
-                    embedding_layer,
-                    eps_params=params,
-                )
-            )
-
-        pivot_repr = _embedding_representation(pivot_embedding)
-        variant_reprs = [_embedding_representation(v) for v in variant_embeddings]
-
-        semantic_loss = 0.0
-        for repr_k in variant_reprs:
-            cos_vals = F.cosine_similarity(pivot_repr, repr_k, dim=1)
-            mean_cos = cos_vals.mean()
-            semantic_loss = semantic_loss + torch.clamp(torch.abs(mean_cos - config.kappa) - config.sigma, min=0.0)
-
-        diversity_loss = 0.0
-        n = len(variant_reprs)
-        if n > 1:
-            count = 0
-            for i in range(n):
-                for j in range(n):
-                    if i == j:
-                        continue
-                    cos_vals = F.cosine_similarity(variant_reprs[i], variant_reprs[j], dim=1)
-                    diversity_loss = diversity_loss + cos_vals.mean()
-                    count += 1
-            diversity_loss = diversity_loss / max(count, 1)
-
-        loss = semantic_loss + config.lambda_div * diversity_loss
         optimizer.zero_grad()
-        loss.backward()
+        with torch.enable_grad():
+            variant_embeddings: List[TPSEmbedding] = []
+            for params in eps_params:
+                variant_embeddings.append(
+                    _collect_tpso_embeddings(
+                        clip_wrapper,
+                        embedder,
+                        prepared_chunks,
+                        embedding_layer,
+                        eps_params=params,
+                    )
+                )
+
+            pivot_repr = _embedding_representation(pivot_embedding)
+            variant_reprs = [_embedding_representation(v) for v in variant_embeddings]
+
+            semantic_loss = 0.0
+            for repr_k in variant_reprs:
+                cos_vals = F.cosine_similarity(pivot_repr, repr_k, dim=1)
+                mean_cos = cos_vals.mean()
+                semantic_loss = semantic_loss + torch.clamp(torch.abs(mean_cos - config.kappa) - config.sigma, min=0.0)
+
+            diversity_loss = 0.0
+            n = len(variant_reprs)
+            if n > 1:
+                count = 0
+                for i in range(n):
+                    for j in range(n):
+                        if i == j:
+                            continue
+                        cos_vals = F.cosine_similarity(variant_reprs[i], variant_reprs[j], dim=1)
+                        diversity_loss = diversity_loss + cos_vals.mean()
+                        count += 1
+                diversity_loss = diversity_loss / max(count, 1)
+
+            loss = semantic_loss + config.lambda_div * diversity_loss
+            loss.backward()
         optimizer.step()
 
         logging.debug(
