@@ -129,6 +129,7 @@ def _encode_chunk_with_embeds(
         if hook_handle is not None:
             hook_handle.remove()
 
+    offsets_aligned = None
     if offsets is not None:
         if offsets.shape[:2] != z.shape[:2]:
             logging.error(
@@ -141,7 +142,6 @@ def _encode_chunk_with_embeds(
         offsets_aligned = offsets
         if offsets.shape != z.shape:
             offsets_aligned = offsets.expand_as(z)
-        z = z + offsets_aligned.to(device=z.device, dtype=z.dtype)
 
     pooled = getattr(z, "pooled", None)
 
@@ -167,6 +167,11 @@ def _encode_chunk_with_embeds(
         emphasis.after_transformers()
         z = emphasis.z
         if pooled is not None:
+            z.pooled = pooled
+
+    if offsets_aligned is not None:
+        z = z + offsets_aligned.to(device=z.device, dtype=z.dtype)
+        if pooled is not None and hasattr(z, "pooled"):
             z.pooled = pooled
 
     return z
