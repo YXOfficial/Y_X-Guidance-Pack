@@ -32,11 +32,8 @@ class TPSONode:
 
         logging.info(f"TPSO: Starting Optimization (Target Kappa: {tpso_kappa}, Steps: {tpso_steps})...")
         
-        # Check for inference mode which blocks gradients
-        if torch.is_inference_mode_enabled():
-            logging.warning("TPSO: Inference Mode detected! Gradients cannot be computed. Optimization skipped.")
-            return (unet,)
-
+        # We need to grab the original conditioning first
+        # Usually get_learned_conditioning runs in no_grad/inference_mode, which is fine for getting the starting point
         with torch.no_grad():
             original_cond_obj = p.sd_model.get_learned_conditioning(p.prompts)
         
@@ -63,69 +60,68 @@ class TPSONode:
 
         batch_size = original_cond_tensor.shape[0]
         
-        # --- FAITHFUL OPTIMIZATION (Paper Eq 7 & 8) ---
-        # Note: We optimize in Prompt Space as a proxy for Token Space due to architecture constraints
-        
-        with torch.enable_grad():
-            # Init with noise epsilon ~ N(0, 10^-4)
-            # We use float32 for precision during optimization
-            epsilon = torch.randn_like(original_cond_tensor, device=device, dtype=torch.float32) * 1e-4
-            
-            # We optimize the *resulting embedding* directly to ensure movement
-            # (equivalent to optimizing epsilon in this simplified proxy)
-            optimized_cond = (original_cond_tensor.to(device, dtype=torch.float32) + epsilon).detach()
-            optimized_cond.requires_grad_(True)
-            
-            target_cond_fp32 = original_cond_tensor.to(device, dtype=torch.float32).detach()
-            
-            # Constants
-            kappa = tpso_kappa
-            sigma = 0.01
-            
-            # Using manual Gradient Descent for transparency and reliability
-            for step in range(tpso_steps):
-                v_prime = optimized_cond.view(batch_size, -1)
-                v = target_cond_fp32.view(batch_size, -1)
+        # --- CRITICAL FIX: FORCE EXIT INFERENCE MODE ---
+        # We must exit inference_mode to allow creating tensors with requires_grad=True
+        # and to allow autograd to record operations.
+        with torch.inference_mode(False):
+            with torch.enable_grad():
+                # Init with noise epsilon ~ N(0, 10^-4)
+                # We use float32 for precision during optimization
+                # Detach() removes it from the previous inference-mode graph
+                epsilon = torch.randn_like(original_cond_tensor, device=device, dtype=torch.float32) * 1e-4
                 
-                v_prime_norm = F.normalize(v_prime, p=2, dim=1)
-                v_norm = F.normalize(v, p=2, dim=1)
+                # Create leaf tensor for optimization
+                optimized_cond = (original_cond_tensor.to(device, dtype=torch.float32) + epsilon).detach()
+                optimized_cond.requires_grad_(True)
                 
-                # Cosine Similarity
-                cos_sim = (v_prime_norm * v_norm).sum(dim=1)
+                target_cond_fp32 = original_cond_tensor.to(device, dtype=torch.float32).detach()
                 
-                # Semantic Alignment Loss (Eq 7): Sum(max(0, |cos - kappa| - sigma))
-                # Using Sum as per paper text
-                diff = torch.abs(cos_sim - kappa) - sigma
-                l_semantic = torch.clamp(diff, min=0.0).sum()
+                # Constants
+                kappa = tpso_kappa
+                sigma = 0.01
                 
-                # Diversity Loss (Eq 8)
-                l_div = torch.tensor(0.0, device=device, dtype=torch.float32)
-                if batch_size > 1:
-                    sim_matrix = torch.mm(v_prime_norm, v_prime_norm.t())
-                    # Mask diagonal
-                    mask = torch.eye(batch_size, device=device).bool()
-                    off_diag = sim_matrix[~mask]
-                    if off_diag.numel() > 0:
-                        l_div = off_diag.mean() # Paper says sum/N(N-1) which is mean of off-diagonals
+                # Manual Gradient Descent
+                for step in range(tpso_steps):
+                    v_prime = optimized_cond.view(batch_size, -1)
+                    v = target_cond_fp32.view(batch_size, -1)
+                    
+                    v_prime_norm = F.normalize(v_prime, p=2, dim=1)
+                    v_norm = F.normalize(v, p=2, dim=1)
+                    
+                    # Cosine Similarity
+                    cos_sim = (v_prime_norm * v_norm).sum(dim=1)
+                    
+                    # Semantic Alignment Loss (Eq 7): Sum(max(0, |cos - kappa| - sigma))
+                    diff = torch.abs(cos_sim - kappa) - sigma
+                    l_semantic = torch.clamp(diff, min=0.0).sum()
+                    
+                    # Diversity Loss (Eq 8)
+                    l_div = torch.tensor(0.0, device=device, dtype=torch.float32)
+                    if batch_size > 1:
+                        sim_matrix = torch.mm(v_prime_norm, v_prime_norm.t())
+                        # Mask diagonal
+                        mask = torch.eye(batch_size, device=device).bool()
+                        off_diag = sim_matrix[~mask]
+                        if off_diag.numel() > 0:
+                            l_div = off_diag.mean()
+                    
+                    loss = l_semantic + tpso_lambda * l_div
+                    
+                    if loss.item() < 1e-6:
+                        break
+                    
+                    # Compute Gradients manually
+                    # allow_unused=True just in case, though not expected
+                    grads = torch.autograd.grad(loss, optimized_cond, create_graph=False, allow_unused=True)[0]
+                    
+                    if grads is not None:
+                        with torch.no_grad():
+                            optimized_cond.sub_(grads * tpso_lr)
+                    
+                    if step == 0 or step == tpso_steps - 1:
+                        logging.debug(f"TPSO Step {step}: Loss={loss.item():.4f}, CosSim={cos_sim.mean().item():.4f}")
                 
-                loss = l_semantic + tpso_lambda * l_div
-                
-                if loss.item() < 1e-6:
-                    # Converged
-                    break
-                
-                # Compute Gradients manually
-                grads = torch.autograd.grad(loss, optimized_cond, create_graph=False)[0]
-                
-                # Update (Gradient Descent)
-                # We want to minimize Loss, so sub_(lr * grad)
-                with torch.no_grad():
-                    optimized_cond.sub_(grads * tpso_lr)
-                
-                if step == 0 or step == tpso_steps - 1:
-                    logging.debug(f"TPSO Step {step}: Loss={loss.item():.4f}, CosSim={cos_sim.mean().item():.4f}")
-            
-            final_optimized_cond = optimized_cond.to(dtype).detach()
+                final_optimized_cond = optimized_cond.to(dtype).detach()
 
         # Log final stats
         with torch.no_grad():
@@ -158,7 +154,6 @@ class TPSONode:
                             for i in range(current_emb.shape[0]):
                                 slice_to_check = current_emb[i:i+1]
                                 for j in range(target_bs):
-                                    # Relaxed tolerance slightly for float16 matching
                                     if torch.allclose(slice_to_check.float(), ref_cond[j:j+1].float(), atol=1e-3):
                                         new_emb[i] = final_optimized_cond[j]
                                         break
