@@ -659,6 +659,11 @@ GUIDANCE_PARAM_KEYS = [
     "QSilk stride",
     "QSilk aqclip_alpha",
     "QSilk ema_beta",
+    "TPSO Enabled",
+    "TPSO Steps",
+    "TPSO LR",
+    "TPSO Lambda",
+    "TPSO r",
 ]
 
 
