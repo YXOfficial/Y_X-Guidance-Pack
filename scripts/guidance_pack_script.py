@@ -16,6 +16,7 @@ from nodes_cfg_zero import CFGZeroNode
 from nodes_fdg import FDGNode
 from nodes_zeresfdg import ZeResFDGNode
 from nodes_s2_guidance import S2GuidanceNode
+from nodes_tpso import TPSONode
 
 
 class GuidancePackScript(scripts.Script):
@@ -55,10 +56,18 @@ class GuidancePackScript(scripts.Script):
         self.qsilk_aqclip_alpha = 2.0
         self.qsilk_ema_beta = 0.8
 
+        self.tpso_enabled = False
+        self.tpso_steps = 10
+        self.tpso_lr = 0.01
+        self.tpso_lambda = 0.5
+        self.tpso_r = 0.4
+        self.tpso_kappa = 0.8
+
         self.cfg_zero_node = CFGZeroNode()
         self.fdg_node = FDGNode()
         self.zeresfdg_node = ZeResFDGNode()
         self.s2_guidance_node = S2GuidanceNode()
+        self.tpso_node = TPSONode()
 
     sorting_priority = 15.0
 
@@ -70,7 +79,7 @@ class GuidancePackScript(scripts.Script):
 
     def ui(self, *args, **kwargs):
         with gr.Accordion(open=False, label=self.title()):
-            gr.Markdown("Unified UI for CFG-Zero, FDG, ZeResFDG, and S²-Guidance.")
+            gr.Markdown("Unified UI for CFG-Zero, FDG, ZeResFDG, S²-Guidance, and TPSO.")
             with gr.Tabs():
                 with gr.Tab(label="CFG-Zero"):
                     gr.Markdown("Enable CFG-Zero guidance adjustments.")
@@ -133,7 +142,7 @@ class GuidancePackScript(scripts.Script):
                         maximum=0.5,
                         step=0.01,
                         value=self.s2_drop_ratio,
-                        info="Tỷ lệ khối UNet/DiT bị bỏ qua. Bài báo đề xuất ~0.1 (10%)",
+                        info="Ratio of UNet/DiT blocks to drop. Paper suggests ~0.1 (10%)",
                     )
 
                 with gr.Tab(label="QSilk"):
@@ -210,6 +219,23 @@ class GuidancePackScript(scripts.Script):
                         step=0.01,
                         value=self.qsilk_ema_beta,
                     )
+                
+                with gr.Tab(label="TPSO"):
+                    gr.Markdown("Token-Prompt embedding Space Optimization (Diversity).")
+                    tpso_enabled = gr.Checkbox(label="Enable TPSO", value=self.tpso_enabled)
+                    tpso_steps = gr.Slider(
+                        label="Optimization Steps", minimum=1, maximum=50, step=1, value=self.tpso_steps
+                    )
+                    tpso_lr = gr.Slider(
+                        label="Learning Rate", minimum=0.001, maximum=0.1, step=0.001, value=self.tpso_lr
+                    )
+                    tpso_lambda = gr.Slider(
+                        label="Diversity Lambda", minimum=0.0, maximum=5.0, step=0.1, value=self.tpso_lambda
+                    )
+                    tpso_r = gr.Slider(
+                        label="Schedule Ratio (r)", minimum=0.0, maximum=1.0, step=0.05, value=self.tpso_r,
+                        info="Proportion of early steps to use optimized embeddings (0.4 = 40%)."
+                    )
 
         cfg_zero_enabled.change(lambda x: setattr(self, "cfg_zero_enabled", x), inputs=[cfg_zero_enabled], outputs=None)
         zero_init_first_step.change(
@@ -261,6 +287,12 @@ class GuidancePackScript(scripts.Script):
         )
         qsilk_ema_beta.change(lambda x: setattr(self, "qsilk_ema_beta", x), inputs=[qsilk_ema_beta], outputs=None)
 
+        tpso_enabled.change(lambda x: setattr(self, "tpso_enabled", x), inputs=[tpso_enabled], outputs=None)
+        tpso_steps.change(lambda x: setattr(self, "tpso_steps", x), inputs=[tpso_steps], outputs=None)
+        tpso_lr.change(lambda x: setattr(self, "tpso_lr", x), inputs=[tpso_lr], outputs=None)
+        tpso_lambda.change(lambda x: setattr(self, "tpso_lambda", x), inputs=[tpso_lambda], outputs=None)
+        tpso_r.change(lambda x: setattr(self, "tpso_r", x), inputs=[tpso_r], outputs=None)
+
         self.ui_controls = [
             cfg_zero_enabled,
             zero_init_first_step,
@@ -291,6 +323,11 @@ class GuidancePackScript(scripts.Script):
             qsilk_stride,
             qsilk_aqclip_alpha,
             qsilk_ema_beta,
+            tpso_enabled,
+            tpso_steps,
+            tpso_lr,
+            tpso_lambda,
+            tpso_r,
         ]
         return self.ui_controls
 
@@ -327,6 +364,11 @@ class GuidancePackScript(scripts.Script):
                 self.qsilk_stride,
                 self.qsilk_aqclip_alpha,
                 self.qsilk_ema_beta,
+                self.tpso_enabled,
+                self.tpso_steps,
+                self.tpso_lr,
+                self.tpso_lambda,
+                self.tpso_r,
             ) = args[:expected_args]
         else:
             logging.warning("Guidance Pack: Not enough arguments provided from UI.")
@@ -399,6 +441,18 @@ class GuidancePackScript(scripts.Script):
             self.qsilk_aqclip_alpha = float(qsilk_xyz["aqclip_alpha"])
         if "ema_beta" in qsilk_xyz:
             self.qsilk_ema_beta = float(qsilk_xyz["ema_beta"])
+
+        tpso_xyz = xyz_settings.get("tpso", {})
+        if "tpso_enabled" in tpso_xyz:
+            self.tpso_enabled = str(tpso_xyz["tpso_enabled"]).lower() == "true"
+        if "tpso_steps" in tpso_xyz:
+            self.tpso_steps = int(tpso_xyz["tpso_steps"])
+        if "tpso_lr" in tpso_xyz:
+            self.tpso_lr = float(tpso_xyz["tpso_lr"])
+        if "tpso_lambda" in tpso_xyz:
+            self.tpso_lambda = float(tpso_xyz["tpso_lambda"])
+        if "tpso_r" in tpso_xyz:
+            self.tpso_r = float(tpso_xyz["tpso_r"])
 
         restored = reset_unet_if_needed(p)
         if restored:
@@ -487,6 +541,30 @@ class GuidancePackScript(scripts.Script):
                 self.s2_drop_ratio,
             )
 
+        if self.tpso_enabled:
+            patched_unet = self.tpso_node.patch(
+                p.sd_model.forge_objects.unet,
+                p=p,
+                tpso_enabled=self.tpso_enabled,
+                tpso_steps=self.tpso_steps,
+                tpso_lr=self.tpso_lr,
+                tpso_lambda=self.tpso_lambda,
+                tpso_r=self.tpso_r,
+                tpso_kappa=self.tpso_kappa,
+            )[0]
+            p.sd_model.forge_objects.unet = patched_unet
+            p.extra_generation_params["TPSO Enabled"] = self.tpso_enabled
+            p.extra_generation_params["TPSO Steps"] = self.tpso_steps
+            p.extra_generation_params["TPSO LR"] = self.tpso_lr
+            p.extra_generation_params["TPSO Lambda"] = self.tpso_lambda
+            p.extra_generation_params["TPSO r"] = self.tpso_r
+            logging.debug(
+                "TPSO: Patch applied. Enabled=%s, steps=%s, r=%s",
+                self.tpso_enabled,
+                self.tpso_steps,
+                self.tpso_r,
+            )
+
         pipeline = None
         needs_qsilk_pipeline = self.qsilk_enabled or hasattr(p.sd_model.forge_objects.unet, "_guidance_pipeline")
         if needs_qsilk_pipeline:
@@ -557,7 +635,7 @@ def make_guidance_axis_on_xyz_grid():
     if xyz_grid is None:
         return
 
-    prefixes = ["(CFG-Zero)", "(FDG)", "(ZeResFDG)", "(S2-Guidance)", "(QSilk)"]
+    prefixes = ["(CFG-Zero)", "(FDG)", "(ZeResFDG)", "(S2-Guidance)", "(QSilk)", "(TPSO)"]
     if any(opt.label.startswith(prefix) for opt in xyz_grid.axis_options for prefix in prefixes):
         return
 
@@ -706,6 +784,32 @@ def make_guidance_axis_on_xyz_grid():
             label="(QSilk) ema_beta",
             type=float,
             apply=partial(set_guidance_value, feature="qsilk", field="ema_beta"),
+        ),
+        xyz_grid.AxisOption(
+            label="(TPSO) Enabled",
+            type=str,
+            apply=partial(set_guidance_value, feature="tpso", field="tpso_enabled"),
+            choices=lambda: ["True", "False"],
+        ),
+        xyz_grid.AxisOption(
+            label="(TPSO) Steps",
+            type=int,
+            apply=partial(set_guidance_value, feature="tpso", field="tpso_steps"),
+        ),
+        xyz_grid.AxisOption(
+            label="(TPSO) LR",
+            type=float,
+            apply=partial(set_guidance_value, feature="tpso", field="tpso_lr"),
+        ),
+        xyz_grid.AxisOption(
+            label="(TPSO) Lambda",
+            type=float,
+            apply=partial(set_guidance_value, feature="tpso", field="tpso_lambda"),
+        ),
+        xyz_grid.AxisOption(
+            label="(TPSO) r (Schedule)",
+            type=float,
+            apply=partial(set_guidance_value, feature="tpso", field="tpso_r"),
         ),
     ]
     xyz_grid.axis_options.extend(options)
