@@ -39,13 +39,11 @@ class TPSONode:
         dtype = devices.dtype_unet
         
         original_cond_tensor = None
-        target_key = "c_crossattn"
         
         # Extract Tensor Logic
         if isinstance(original_cond_obj, dict):
             for k in ['crossattn', 'c_crossattn', 'cond']:
                 if k in original_cond_obj:
-                    target_key = k
                     original_cond_tensor = original_cond_obj[k]
                     break
             if original_cond_tensor is None:
@@ -60,17 +58,11 @@ class TPSONode:
         batch_size = original_cond_tensor.shape[0]
         
         # --- OPTIMIZATION BLOCK ---
-        # Force exit inference mode to allow gradients
         with torch.inference_mode(False):
             with torch.enable_grad():
                 target_cond_fp32 = original_cond_tensor.to(device, dtype=torch.float32).detach()
-                
-                # Paper Algorithm 1: Initialize epsilon ~ N(0, 10^-4)
-                # Note: We optimize epsilon directly as per paper
                 epsilon = torch.randn_like(target_cond_fp32) * 1e-4
                 epsilon.requires_grad_(True)
-                
-                # Paper uses Adam
                 optimizer = optim.Adam([epsilon], lr=tpso_lr)
                 
                 kappa = tpso_kappa
@@ -78,10 +70,6 @@ class TPSONode:
                 
                 for step in range(tpso_steps):
                     optimizer.zero_grad()
-                    
-                    # Recompute v' = f(E(token + epsilon)) -> approximated here as (cond + epsilon)
-                    # Since we can't easily backprop through the frozen CLIP model in this environment 
-                    # without huge overhead, we optimize the embedding space directly (standard practice for this type of plugin)
                     optimized_cond = target_cond_fp32 + epsilon
                     
                     v_prime = optimized_cond.view(batch_size, -1)
@@ -92,11 +80,9 @@ class TPSONode:
                     
                     cos_sim = (v_prime_norm * v_norm).sum(dim=1)
                     
-                    # Semantic Loss: max(0, |cos - kappa| - sigma)
                     diff = torch.abs(cos_sim - kappa) - sigma
                     l_semantic = torch.clamp(diff, min=0.0).sum()
                     
-                    # Diversity Loss
                     l_div = torch.tensor(0.0, device=device, dtype=torch.float32)
                     if batch_size > 1:
                         sim_matrix = torch.mm(v_prime_norm, v_prime_norm.t())
@@ -106,7 +92,6 @@ class TPSONode:
                             l_div = off_diag.mean()
                     
                     loss = l_semantic + tpso_lambda * l_div
-                    
                     loss.backward()
                     optimizer.step()
                     
@@ -115,7 +100,7 @@ class TPSONode:
 
                 final_optimized_cond = (target_cond_fp32 + epsilon).to(dtype).detach()
 
-        # Final Verification
+        # Log final result
         with torch.no_grad():
             final_v_prime = F.normalize(final_optimized_cond.view(batch_size, -1).float(), p=2, dim=1)
             final_v = F.normalize(original_cond_tensor.view(batch_size, -1).float(), p=2, dim=1)
@@ -123,32 +108,67 @@ class TPSONode:
         
         logging.info(f"TPSO: Optimization Finished. Final Cosine Sim: {actual_sim:.4f} (Target: {kappa})")
 
-        # --- WRAPPER ---
+        # --- WRAPPER WITH DEBUGGING & FORCE INJECTION ---
         max_t = 999.0
         threshold = max_t * (1.0 - tpso_r)
-        ref_cond = original_cond_tensor.to(device, dtype=dtype).detach()
+        
+        # We define a unique ID for this patch to track it in logs without spamming too much
+        patch_id = id(final_optimized_cond)
 
         def unet_wrapper(apply_model, args):
             t = args["timestep"]
             t_curr = t[0].item() if torch.is_tensor(t) else t
             
-            if t_curr > threshold:
+            # Debug log only once per threshold crossing to avoid spam
+            should_inject = t_curr > threshold
+            
+            if should_inject:
                 c = args["c"]
+                injected = False
+                
+                # Check keys
                 for key in ["c_crossattn", "crossattn"]:
                     if key in c and isinstance(c[key], torch.Tensor):
                         current_emb = c[key]
+                        
+                        # Only proceed if shapes are compatible
+                        # final_optimized_cond shape: [Batch_Prompts, Seq_Len, Dim]
                         if current_emb.shape[-1] == final_optimized_cond.shape[-1]:
                             new_c = c.copy()
                             new_emb = current_emb.clone()
-                            target_bs = final_optimized_cond.shape[0]
-                            for i in range(current_emb.shape[0]):
-                                slice_to_check = current_emb[i:i+1]
-                                for j in range(target_bs):
-                                    if torch.allclose(slice_to_check.float(), ref_cond[j:j+1].float(), atol=1e-3):
-                                        new_emb[i] = final_optimized_cond[j]
-                                        break
-                            new_c[key] = new_emb
-                            return apply_model(args["input"], args["timestep"], **new_c)
+                            
+                            target_bs = final_optimized_cond.shape[0] # Number of optimized prompts (usually 1)
+                            current_bs = current_emb.shape[0]       # Usually 2 (Neg + Pos)
+                            
+                            # STRATEGY 1: Standard [Uncond, Cond] assumption
+                            # If current batch is exactly 2x optimized batch, assume second half is Positive
+                            if current_bs == 2 * target_bs:
+                                new_emb[target_bs:] = final_optimized_cond
+                                injected = True
+                                # logging.debug(f"TPSO: Injected via Strategy 1 (Standard Batch Split) at t={t_curr:.0f}")
+                            
+                            # STRATEGY 2: Exact Match
+                            elif current_bs == target_bs:
+                                new_emb[:] = final_optimized_cond
+                                injected = True
+                                # logging.debug(f"TPSO: Injected via Strategy 2 (Exact Replacement) at t={t_curr:.0f}")
+                                
+                            else:
+                                # Fallback: Try to match simply by value? No, let's stick to safe strategies first.
+                                pass
+
+                            if injected:
+                                new_c[key] = new_emb
+                                # IMPORTANT: If we injected into one key, we should check if we need to return immediately
+                                # usually c_crossattn is the one.
+                                return apply_model(args["input"], args["timestep"], **new_c)
+                
+                if not injected:
+                    # If we expected to inject but didn't find a place, Log it once!
+                    # We can use a simple trick to log only occasionally or use the step
+                    if int(t_curr) % 100 == 0:
+                         logging.warning(f"TPSO: Active (t={t_curr:.0f}) but FAILED to inject! Keys: {list(c.keys())}")
+
             return apply_model(args["input"], args["timestep"], **args["c"])
 
         patched_unet = unet.clone()
