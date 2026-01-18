@@ -36,7 +36,6 @@ class TPSONode:
             original_cond_obj = p.sd_model.get_learned_conditioning(p.prompts)
         
         # Handle Dictionary vs Tensor (SDXL vs SD1.5)
-        # SDXL returns dict with 'crossattn', SD1.5 often returns Tensor directly
         original_cond = original_cond_obj
         target_key = None
         
@@ -48,8 +47,6 @@ class TPSONode:
             elif 'cond' in original_cond_obj:
                  target_key = 'cond'
             else:
-                # Fallback: take the first value that looks like a tensor of shape [B, L, D]
-                # This handles custom model outputs
                 target_key = next((k for k, v in original_cond_obj.items() if isinstance(v, torch.Tensor) and v.ndim == 3), None)
             
             if target_key is None:
@@ -58,7 +55,6 @@ class TPSONode:
             
             original_cond = original_cond_obj[target_key]
         
-        # Verify we have a tensor now
         if not isinstance(original_cond, torch.Tensor):
              logging.warning(f"TPSO: Conditioning object is {type(original_cond)}, expected Tensor. Skipping.")
              return (unet,)
@@ -66,7 +62,6 @@ class TPSONode:
         device = devices.device
         dtype = devices.dtype_unet
         
-        # Clone and detach to create a leaf tensor that requires grad
         optimized_cond = original_cond.clone().to(device, dtype=torch.float32).detach()
         optimized_cond.requires_grad_(True)
         
@@ -97,7 +92,6 @@ class TPSONode:
                     
                 logging.debug(f"TPSO: Optimization done. Final Loss: {loss.item():.4f}")
             else:
-                # Single batch: Perturb to create a "variant"
                 logging.info("TPSO: Single batch. Applying perturbation to escape mode.")
                 with torch.no_grad():
                      noise = torch.randn_like(original_cond) * (tpso_lr * 10.0) 
@@ -110,8 +104,9 @@ class TPSONode:
             t = args["timestep"]
             t_curr = t[0].item() if torch.is_tensor(t) else t
             
-            # TODO: Detect actual max_t from model if possible, defaulting to 1000
-            max_t = 1000.0
+            # Identify max_t (999.0 for SD)
+            # Some models might have different range, but 999 is standard.
+            max_t = 999.0
             threshold = max_t * (1.0 - tpso_r)
             
             if t_curr > threshold:
@@ -120,26 +115,17 @@ class TPSONode:
                 new_c = c.copy()
                 
                 # Injection logic
-                # We target 'c_crossattn' in the args passed to apply_model (standard Forge/LDM convention)
                 if "c_crossattn" in c:
                     current_emb = c["c_crossattn"]
                     
-                    # Check if it's a tensor or list (DDPM sometimes uses lists)
-                    if isinstance(current_emb, list):
-                        # Not handling list replacement yet for safety
-                        pass
-                    elif isinstance(current_emb, torch.Tensor):
+                    if isinstance(current_emb, torch.Tensor):
                         curr_bs = current_emb.shape[0]
                         target_bs = final_optimized_cond.shape[0]
                         
                         new_emb = current_emb.clone()
                         
-                        # Heuristic to find where to inject:
-                        # Usually Uncond (Negative) is first, Cond (Positive) is second.
-                        # We want to replace Cond.
-                        
                         if curr_bs == 2 * target_bs:
-                            # Replace second half
+                            # Replace second half (Cond)
                             new_emb[target_bs:] = final_optimized_cond
                         elif curr_bs == target_bs:
                             # Replace all
@@ -147,25 +133,24 @@ class TPSONode:
                         
                         new_c["c_crossattn"] = new_emb
                         new_args["c"] = new_c
-                        return apply_model(new_args)
+                        # Call apply_model with correct ReForge signature: (x, t, **c)
+                        return apply_model(new_args["input"], new_args["timestep"], **new_args["c"])
                 
-                # If using SDXL dict-based 'crossattn' in args?
-                # Usually it's flattened to c_crossattn by the time it hits UNet, 
-                # but let's be safe.
+                # SDXL case
                 if "crossattn" in c and isinstance(c["crossattn"], torch.Tensor):
-                     # Similar logic for SDXL specific keys if present
                      current_emb = c["crossattn"]
                      if current_emb.shape[0] == final_optimized_cond.shape[0]:
                          new_c["crossattn"] = final_optimized_cond
                          new_args["c"] = new_c
-                         return apply_model(new_args)
+                         return apply_model(new_args["input"], new_args["timestep"], **new_args["c"])
 
-            return apply_model(args)
+            # Default call with ReForge signature
+            return apply_model(args["input"], args["timestep"], **args["c"])
 
         patched_unet = unet.clone()
         patched_unet.set_model_unet_function_wrapper(unet_wrapper)
         
-        logging.info(f"TPSO: Patch applied. Schedule: t > {1000*(1-tpso_r):.0f} uses optimized embeddings.")
+        logging.info(f"TPSO: Patch applied. Schedule: t > {max_t*(1-tpso_r):.0f} uses optimized embeddings.")
         return (patched_unet,)
 
 NODE_CLASS_MAPPINGS = {
