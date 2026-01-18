@@ -99,15 +99,14 @@ class TPSONode:
 
         final_optimized_cond = optimized_cond.to(dtype).detach()
         
+        # Define max_t outside wrapper for logging and threshold calculation
+        max_t = 999.0
+        threshold = max_t * (1.0 - tpso_r)
+
         # 2. Define Wrapper for UNet Forward
         def unet_wrapper(apply_model, args):
             t = args["timestep"]
             t_curr = t[0].item() if torch.is_tensor(t) else t
-            
-            # Identify max_t (999.0 for SD)
-            # Some models might have different range, but 999 is standard.
-            max_t = 999.0
-            threshold = max_t * (1.0 - tpso_r)
             
             if t_curr > threshold:
                 new_args = args.copy()
@@ -133,7 +132,6 @@ class TPSONode:
                         
                         new_c["c_crossattn"] = new_emb
                         new_args["c"] = new_c
-                        # Call apply_model with correct ReForge signature: (x, t, **c)
                         return apply_model(new_args["input"], new_args["timestep"], **new_args["c"])
                 
                 # SDXL case
@@ -144,13 +142,12 @@ class TPSONode:
                          new_args["c"] = new_c
                          return apply_model(new_args["input"], new_args["timestep"], **new_args["c"])
 
-            # Default call with ReForge signature
             return apply_model(args["input"], args["timestep"], **args["c"])
 
         patched_unet = unet.clone()
         patched_unet.set_model_unet_function_wrapper(unet_wrapper)
         
-        logging.info(f"TPSO: Patch applied. Schedule: t > {max_t*(1-tpso_r):.0f} uses optimized embeddings.")
+        logging.info(f"TPSO: Patch applied. Schedule: t > {threshold:.0f} uses optimized embeddings.")
         return (patched_unet,)
 
 NODE_CLASS_MAPPINGS = {
