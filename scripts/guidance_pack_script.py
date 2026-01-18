@@ -236,6 +236,10 @@ class GuidancePackScript(scripts.Script):
                         label="Schedule Ratio (r)", minimum=0.0, maximum=1.0, step=0.05, value=self.tpso_r,
                         info="Proportion of early steps to use optimized embeddings (0.4 = 40%)."
                     )
+                    tpso_kappa = gr.Slider(
+                        label="Semantic Retention (Kappa)", minimum=0.5, maximum=1.0, step=0.01, value=self.tpso_kappa,
+                        info="Target cosine similarity. Higher = more faithful to prompt, Lower = more diverse."
+                    )
 
         cfg_zero_enabled.change(lambda x: setattr(self, "cfg_zero_enabled", x), inputs=[cfg_zero_enabled], outputs=None)
         zero_init_first_step.change(
@@ -292,6 +296,7 @@ class GuidancePackScript(scripts.Script):
         tpso_lr.change(lambda x: setattr(self, "tpso_lr", x), inputs=[tpso_lr], outputs=None)
         tpso_lambda.change(lambda x: setattr(self, "tpso_lambda", x), inputs=[tpso_lambda], outputs=None)
         tpso_r.change(lambda x: setattr(self, "tpso_r", x), inputs=[tpso_r], outputs=None)
+        tpso_kappa.change(lambda x: setattr(self, "tpso_kappa", x), inputs=[tpso_kappa], outputs=None)
 
         self.ui_controls = [
             cfg_zero_enabled,
@@ -328,6 +333,7 @@ class GuidancePackScript(scripts.Script):
             tpso_lr,
             tpso_lambda,
             tpso_r,
+            tpso_kappa,
         ]
         return self.ui_controls
 
@@ -369,6 +375,7 @@ class GuidancePackScript(scripts.Script):
                 self.tpso_lr,
                 self.tpso_lambda,
                 self.tpso_r,
+                self.tpso_kappa,
             ) = args[:expected_args]
         else:
             logging.warning("Guidance Pack: Not enough arguments provided from UI.")
