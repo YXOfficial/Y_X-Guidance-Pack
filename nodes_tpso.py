@@ -14,7 +14,7 @@ class TPSONode:
                 "p": ("PROCESSING",),
                 "tpso_enabled": ("BOOLEAN", {"default": False}),
                 "tpso_steps": ("INT", {"default": 20, "min": 1, "max": 100}),
-                "tpso_lr": ("FLOAT", {"default": 0.2, "min": 0.0001, "max": 1.0, "step": 0.001}),
+                "tpso_lr": ("FLOAT", {"default": 0.1, "min": 0.0001, "max": 1.0, "step": 0.001}),
                 "tpso_lambda": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1}),
                 "tpso_r": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "tpso_kappa": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 0.99, "step": 0.01}),
@@ -26,11 +26,11 @@ class TPSONode:
     CATEGORY = "advanced/model_patches"
     DESCRIPTION = "Training-Free Prompt Semantic Space Optimization (TPSO) - Faithful Implementation."
 
-    def patch(self, unet, p, tpso_enabled=False, tpso_steps=20, tpso_lr=0.2, tpso_lambda=1.0, tpso_r=0.4, tpso_kappa=0.8):
+    def patch(self, unet, p, tpso_enabled=False, tpso_steps=20, tpso_lr=0.1, tpso_lambda=1.0, tpso_r=0.4, tpso_kappa=0.8):
         if not tpso_enabled:
             return (unet,)
 
-        logging.info(f"TPSO: Starting Optimization (Target Kappa: {tpso_kappa}, Steps: {tpso_steps})...")
+        logging.info(f"TPSO: Starting Optimization (Target Kappa: {tpso_kappa}, Steps: {tpso_steps}, LR: {tpso_lr})...")
         
         with torch.no_grad():
             original_cond_obj = p.sd_model.get_learned_conditioning(p.prompts)
@@ -41,6 +41,7 @@ class TPSONode:
         original_cond_tensor = None
         target_key = "c_crossattn"
         
+        # Extract Tensor Logic
         if isinstance(original_cond_obj, dict):
             for k in ['crossattn', 'c_crossattn', 'cond']:
                 if k in original_cond_obj:
@@ -58,21 +59,31 @@ class TPSONode:
 
         batch_size = original_cond_tensor.shape[0]
         
-        # Force Enable Grad
+        # --- OPTIMIZATION BLOCK ---
+        # Force exit inference mode to allow gradients
         with torch.inference_mode(False):
             with torch.enable_grad():
-                # 1. KICKSTART: Use larger noise (1e-2) to escape the zero-gradient peak at CosSim=1.0
-                epsilon = torch.randn_like(original_cond_tensor, device=device, dtype=torch.float32) * 1e-2
-                
-                optimized_cond = (original_cond_tensor.to(device, dtype=torch.float32) + epsilon).detach()
-                optimized_cond.requires_grad_(True)
-                
                 target_cond_fp32 = original_cond_tensor.to(device, dtype=torch.float32).detach()
+                
+                # Paper Algorithm 1: Initialize epsilon ~ N(0, 10^-4)
+                # Note: We optimize epsilon directly as per paper
+                epsilon = torch.randn_like(target_cond_fp32) * 1e-4
+                epsilon.requires_grad_(True)
+                
+                # Paper uses Adam
+                optimizer = optim.Adam([epsilon], lr=tpso_lr)
                 
                 kappa = tpso_kappa
                 sigma = 0.01
                 
                 for step in range(tpso_steps):
+                    optimizer.zero_grad()
+                    
+                    # Recompute v' = f(E(token + epsilon)) -> approximated here as (cond + epsilon)
+                    # Since we can't easily backprop through the frozen CLIP model in this environment 
+                    # without huge overhead, we optimize the embedding space directly (standard practice for this type of plugin)
+                    optimized_cond = target_cond_fp32 + epsilon
+                    
                     v_prime = optimized_cond.view(batch_size, -1)
                     v = target_cond_fp32.view(batch_size, -1)
                     
@@ -81,7 +92,7 @@ class TPSONode:
                     
                     cos_sim = (v_prime_norm * v_norm).sum(dim=1)
                     
-                    # Semantic Alignment Loss
+                    # Semantic Loss: max(0, |cos - kappa| - sigma)
                     diff = torch.abs(cos_sim - kappa) - sigma
                     l_semantic = torch.clamp(diff, min=0.0).sum()
                     
@@ -96,26 +107,15 @@ class TPSONode:
                     
                     loss = l_semantic + tpso_lambda * l_div
                     
-                    if loss.item() < 1e-6:
-                        break
-                    
-                    # Manual Backprop
-                    grads = torch.autograd.grad(loss, optimized_cond, create_graph=False, allow_unused=True)[0]
-                    
-                    if grads is not None:
-                        # 2. GRADIENT NORMALIZATION: Ensure consistent step size regardless of flatness
-                        grad_norm = grads.norm() + 1e-8
-                        normalized_grads = grads / grad_norm
-                        
-                        with torch.no_grad():
-                            # Move with constant velocity 'lr'
-                            optimized_cond.sub_(normalized_grads * tpso_lr)
+                    loss.backward()
+                    optimizer.step()
                     
                     if step == 0 or step == tpso_steps - 1:
-                        logging.debug(f"TPSO Step {step}: Loss={loss.item():.4f}, CosSim={cos_sim.mean().item():.4f}, GradNorm={grad_norm.item():.6f}")
-                
-                final_optimized_cond = optimized_cond.to(dtype).detach()
+                         logging.debug(f"TPSO Step {step}: Loss={loss.item():.4f}, CosSim={cos_sim.mean().item():.4f}")
 
+                final_optimized_cond = (target_cond_fp32 + epsilon).to(dtype).detach()
+
+        # Final Verification
         with torch.no_grad():
             final_v_prime = F.normalize(final_optimized_cond.view(batch_size, -1).float(), p=2, dim=1)
             final_v = F.normalize(original_cond_tensor.view(batch_size, -1).float(), p=2, dim=1)
@@ -123,6 +123,7 @@ class TPSONode:
         
         logging.info(f"TPSO: Optimization Finished. Final Cosine Sim: {actual_sim:.4f} (Target: {kappa})")
 
+        # --- WRAPPER ---
         max_t = 999.0
         threshold = max_t * (1.0 - tpso_r)
         ref_cond = original_cond_tensor.to(device, dtype=dtype).detach()
