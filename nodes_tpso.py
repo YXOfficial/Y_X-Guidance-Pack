@@ -32,20 +32,41 @@ class TPSONode:
         logging.info(f"TPSO: Starting optimization for {len(p.prompts)} prompts...")
         
         # 1. Optimization Phase (Context Optimization)
-        # We optimize the embedding (cond) directly since we can't easily backprop through CLIP in all environments.
-        
-        # Get original embeddings
-        # We use p.sd_model to get conditioning.
-        # This gives us the target to stay close to.
         with torch.no_grad():
-            original_cond = p.sd_model.get_learned_conditioning(p.prompts)
-            # original_cond: [B, 77, 768] (SD1.5)
+            original_cond_obj = p.sd_model.get_learned_conditioning(p.prompts)
         
+        # Handle Dictionary vs Tensor (SDXL vs SD1.5)
+        # SDXL returns dict with 'crossattn', SD1.5 often returns Tensor directly
+        original_cond = original_cond_obj
+        target_key = None
+        
+        if isinstance(original_cond_obj, dict):
+            if 'crossattn' in original_cond_obj:
+                target_key = 'crossattn'
+            elif 'c_crossattn' in original_cond_obj:
+                target_key = 'c_crossattn'
+            elif 'cond' in original_cond_obj:
+                 target_key = 'cond'
+            else:
+                # Fallback: take the first value that looks like a tensor of shape [B, L, D]
+                # This handles custom model outputs
+                target_key = next((k for k, v in original_cond_obj.items() if isinstance(v, torch.Tensor) and v.ndim == 3), None)
+            
+            if target_key is None:
+                logging.warning("TPSO: Could not find embedding tensor in conditioning dict. Skipping TPSO.")
+                return (unet,)
+            
+            original_cond = original_cond_obj[target_key]
+        
+        # Verify we have a tensor now
+        if not isinstance(original_cond, torch.Tensor):
+             logging.warning(f"TPSO: Conditioning object is {type(original_cond)}, expected Tensor. Skipping.")
+             return (unet,)
+
         device = devices.device
         dtype = devices.dtype_unet
         
-        # Prepare for optimization
-        # We clone and detach to create a leaf tensor that requires grad
+        # Clone and detach to create a leaf tensor that requires grad
         optimized_cond = original_cond.clone().to(device, dtype=torch.float32).detach()
         optimized_cond.requires_grad_(True)
         
@@ -56,29 +77,21 @@ class TPSONode:
         
         # Optimization Loop
         if tpso_enabled:
-            # If batch > 1, we enforce diversity between samples.
-            # If batch == 1, we apply random perturbation to escape mode (simulated diversity).
-            
             if batch_size > 1:
                 logging.info(f"TPSO: Optimizing batch of {batch_size} for diversity...")
                 for step in range(tpso_steps):
                     optimizer.zero_grad()
-                    
-                    # Semantic Loss: MSE to original
                     l_sem = F.mse_loss(optimized_cond, target_cond)
                     
-                    # Diversity Loss: Minimize pairwise cosine similarity
                     flat = optimized_cond.view(batch_size, -1)
                     flat_norm = F.normalize(flat, p=2, dim=1)
-                    similarity_matrix = torch.mm(flat_norm, flat_norm.t()) # [B, B]
+                    similarity_matrix = torch.mm(flat_norm, flat_norm.t())
                     
-                    # Minimize off-diagonal
                     mask = torch.eye(batch_size, device=device).bool()
                     off_diag = similarity_matrix[~mask]
                     l_div = off_diag.mean() if off_diag.numel() > 0 else torch.tensor(0.0).to(device)
                     
                     loss = l_sem + tpso_lambda * l_div
-                    
                     loss.backward()
                     optimizer.step()
                     
@@ -87,75 +100,68 @@ class TPSONode:
                 # Single batch: Perturb to create a "variant"
                 logging.info("TPSO: Single batch. Applying perturbation to escape mode.")
                 with torch.no_grad():
-                     # Simple random walk away from mode
                      noise = torch.randn_like(original_cond) * (tpso_lr * 10.0) 
                      optimized_cond = original_cond + noise
 
-        # Final optimized embeddings
         final_optimized_cond = optimized_cond.to(dtype).detach()
         
         # 2. Define Wrapper for UNet Forward
-        # unet is a ModelPatcher. We use set_model_unet_function_wrapper.
-        
         def unet_wrapper(apply_model, args):
-            # args: {'input': x, 'timestep': t, 'c': dict, ...}
-            
             t = args["timestep"]
-            # t might be tensor or float
             t_curr = t[0].item() if torch.is_tensor(t) else t
             
-            # Progressive Schedule
-            # T approx 1000.
-            # If t > threshold (early steps), use optimized.
-            # If t <= threshold (late steps), use original (implicit in args['c'] if we don't touch it? 
-            # Wait, args['c'] passed here comes from the Sampler. 
-            # The Sampler uses the prompt passed to it.
-            # Usually that IS 'original_cond'.
-            
+            # TODO: Detect actual max_t from model if possible, defaulting to 1000
             max_t = 1000.0
             threshold = max_t * (1.0 - tpso_r)
             
             if t_curr > threshold:
-                # Inject Optimized Embeddings
-                
-                # Copy args to avoid side effects
                 new_args = args.copy()
                 c = args["c"]
                 new_c = c.copy()
                 
+                # Injection logic
+                # We target 'c_crossattn' in the args passed to apply_model (standard Forge/LDM convention)
                 if "c_crossattn" in c:
-                    current_emb = c["c_crossattn"] # [Batch_Real, 77, 768]
+                    current_emb = c["c_crossattn"]
                     
-                    # Identify where to inject.
-                    # Usually [Uncond, Cond] (Negative, Positive)
-                    # Batch sizes:
-                    # current_emb.shape[0] usually equals 2 * batch_size (if CFG > 1)
-                    
-                    curr_bs = current_emb.shape[0]
-                    target_bs = final_optimized_cond.shape[0]
-                    
-                    new_emb = current_emb.clone()
-                    
-                    if curr_bs == 2 * target_bs:
-                        # Assume [Uncond, Cond] -> Replace second half
-                        new_emb[target_bs:] = final_optimized_cond
-                    elif curr_bs == target_bs:
-                        # Assume [Cond] (Positive only) or we are in a specific pass
-                        # Replace all
-                        new_emb = final_optimized_cond
-                    else:
-                        # Mismatch, skip to avoid error
+                    # Check if it's a tensor or list (DDPM sometimes uses lists)
+                    if isinstance(current_emb, list):
+                        # Not handling list replacement yet for safety
                         pass
-                    
-                    new_c["c_crossattn"] = new_emb
-                    new_args["c"] = new_c
-                    return apply_model(new_args)
-            
-            # Late steps or no change -> Original
+                    elif isinstance(current_emb, torch.Tensor):
+                        curr_bs = current_emb.shape[0]
+                        target_bs = final_optimized_cond.shape[0]
+                        
+                        new_emb = current_emb.clone()
+                        
+                        # Heuristic to find where to inject:
+                        # Usually Uncond (Negative) is first, Cond (Positive) is second.
+                        # We want to replace Cond.
+                        
+                        if curr_bs == 2 * target_bs:
+                            # Replace second half
+                            new_emb[target_bs:] = final_optimized_cond
+                        elif curr_bs == target_bs:
+                            # Replace all
+                            new_emb = final_optimized_cond
+                        
+                        new_c["c_crossattn"] = new_emb
+                        new_args["c"] = new_c
+                        return apply_model(new_args)
+                
+                # If using SDXL dict-based 'crossattn' in args?
+                # Usually it's flattened to c_crossattn by the time it hits UNet, 
+                # but let's be safe.
+                if "crossattn" in c and isinstance(c["crossattn"], torch.Tensor):
+                     # Similar logic for SDXL specific keys if present
+                     current_emb = c["crossattn"]
+                     if current_emb.shape[0] == final_optimized_cond.shape[0]:
+                         new_c["crossattn"] = final_optimized_cond
+                         new_args["c"] = new_c
+                         return apply_model(new_args)
+
             return apply_model(args)
 
-        # Apply the wrapper
-        # We clone the patcher so we don't affect other nodes using the same model instance permanently
         patched_unet = unet.clone()
         patched_unet.set_model_unet_function_wrapper(unet_wrapper)
         
