@@ -14,7 +14,7 @@ class TPSONode:
                 "p": ("PROCESSING",),
                 "tpso_enabled": ("BOOLEAN", {"default": False}),
                 "tpso_steps": ("INT", {"default": 20, "min": 1, "max": 100}),
-                "tpso_lr": ("FLOAT", {"default": 0.05, "min": 0.0001, "max": 1.0, "step": 0.001}),
+                "tpso_lr": ("FLOAT", {"default": 0.01, "min": 0.0001, "max": 1.0, "step": 0.001}),
                 "tpso_lambda": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1}),
                 "tpso_r": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "tpso_kappa": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 0.99, "step": 0.01}),
@@ -24,22 +24,20 @@ class TPSONode:
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
     CATEGORY = "advanced/model_patches"
-    DESCRIPTION = "Training-Free Prompt Semantic Space Optimization (TPSO)."
+    DESCRIPTION = "Training-Free Prompt Semantic Space Optimization (TPSO) - Faithful Implementation."
 
-    def patch(self, unet, p, tpso_enabled=False, tpso_steps=20, tpso_lr=0.05, tpso_lambda=1.0, tpso_r=0.4, tpso_kappa=0.8):
+    def patch(self, unet, p, tpso_enabled=False, tpso_steps=20, tpso_lr=0.01, tpso_lambda=1.0, tpso_r=0.4, tpso_kappa=0.8):
         if not tpso_enabled:
             return (unet,)
 
-        logging.info(f"TPSO: Starting optimization (Steps: {tpso_steps}, Target Kappa: {tpso_kappa})...")
+        logging.info(f"TPSO: Starting Optimization (Faithful to Paper)...")
         
-        # 1. Get Original Conditioning
         with torch.no_grad():
             original_cond_obj = p.sd_model.get_learned_conditioning(p.prompts)
         
         device = devices.device
         dtype = devices.dtype_unet
         
-        # Extract main tensor
         original_cond_tensor = None
         target_key = "c_crossattn"
         
@@ -56,75 +54,68 @@ class TPSONode:
             original_cond_tensor = original_cond_obj
 
         if original_cond_tensor is None or not isinstance(original_cond_tensor, torch.Tensor):
-            logging.warning("TPSO: Could not find valid conditioning tensor.")
             return (unet,)
 
-        # 2. OPTIMIZATION
         batch_size = original_cond_tensor.shape[0]
         
+        # --- FAITHFUL OPTIMIZATION (Paper Eq 7 & 8) ---
         with torch.enable_grad():
-            # Initial epsilon perturbation as per paper
-            # We use a slightly larger noise to ensure we leave the "mode"
-            epsilon = torch.randn_like(original_cond_tensor, device=device, dtype=torch.float32) * 1e-3
-            optimized_cond = (original_cond_tensor.to(device, dtype=torch.float32) + epsilon).detach()
-            optimized_cond.requires_grad_(True)
+            # Init with noise epsilon ~ N(0, 10^-4) as per paper
+            epsilon = torch.randn_like(original_cond_tensor, device=device, dtype=torch.float32) * 1e-4
+            optimized_cond = (original_cond_tensor.to(device, dtype=torch.float32) + epsilon).detach().requires_grad_(True)
             
-            target_cond = original_cond_tensor.to(device, dtype=torch.float32).detach()
-            # Use SGD for more aggressive movement in few steps
-            optimizer = optim.SGD([optimized_cond], lr=tpso_lr, momentum=0.9)
+            target_cond_fp32 = original_cond_tensor.to(device, dtype=torch.float32).detach()
+            optimizer = optim.Adam([optimized_cond], lr=tpso_lr)
             
             kappa = tpso_kappa
-            sigma = 0.01
+            sigma = 0.01 # Tolerance band from paper
             
-            initial_loss = 0
             for step in range(tpso_steps):
                 optimizer.zero_grad()
                 
                 v_prime = optimized_cond.view(batch_size, -1)
-                v = target_cond.view(batch_size, -1)
+                v = target_cond_fp32.view(batch_size, -1)
                 
                 v_prime_norm = F.normalize(v_prime, p=2, dim=1)
                 v_norm = F.normalize(v, p=2, dim=1)
                 
                 cos_sim = (v_prime_norm * v_norm).sum(dim=1)
                 
-                # Semantic Loss (Eq 7)
-                diff = torch.abs(cos_sim - kappa) - sigma
-                l_semantic = F.relu(diff).mean() 
+                # Semantic Alignment Loss (Eq 7): max(0, |cos - kappa| - sigma)
+                l_semantic = torch.clamp(torch.abs(cos_sim - kappa) - sigma, min=0.0).mean()
                 
-                # Diversity Loss (Eq 8)
-                l_div = torch.tensor(0.0, device=device, requires_grad=True)
+                # Diversity Loss (Eq 8): sum of pairwise cosine similarities
+                l_div = torch.tensor(0.0, device=device, dtype=torch.float32)
                 if batch_size > 1:
                     sim_matrix = torch.mm(v_prime_norm, v_prime_norm.t())
                     mask = torch.eye(batch_size, device=device).bool()
                     off_diag = sim_matrix[~mask]
                     if off_diag.numel() > 0:
-                        l_div = off_diag.mean()
+                        l_div = off_diag.mean() # Paper suggests minimizing pairwise similarity
                 
                 loss = l_semantic + tpso_lambda * l_div
                 
-                if step == 0: initial_loss = loss.item()
-                
-                loss.backward()
-                optimizer.step()
+                # Check if we have gradient flow (prevents RuntimeError)
+                if loss.requires_grad:
+                    loss.backward()
+                    optimizer.step()
+                else:
+                    # Already in optimal band, but we can continue or break
+                    pass
             
-            final_loss = loss.item()
             final_optimized_cond = optimized_cond.to(dtype).detach()
 
-        # Verify movement
+        # Log final stats
         with torch.no_grad():
             final_v_prime = F.normalize(final_optimized_cond.view(batch_size, -1).float(), p=2, dim=1)
             final_v = F.normalize(original_cond_tensor.view(batch_size, -1).float(), p=2, dim=1)
             actual_sim = (final_v_prime * final_v).sum(dim=1).mean().item()
         
-        logging.info(f"TPSO: Optimization: Loss {initial_loss:.4f} -> {final_loss:.4f}")
-        logging.info(f"TPSO: Final Cosine Sim: {actual_sim:.4f} (Target: {kappa})")
+        logging.info(f"TPSO: Optimization Finished. Final Cosine Sim: {actual_sim:.4f} (Target: {kappa})")
 
-        # 3. WRAPPER
+        # --- WRAPPER & INJECTION ---
         max_t = 999.0
         threshold = max_t * (1.0 - tpso_r)
-        
-        # Prepare a reference for value-based matching to find positive prompt slice
         ref_cond = original_cond_tensor.to(device, dtype=dtype).detach()
 
         def unet_wrapper(apply_model, args):
@@ -133,7 +124,6 @@ class TPSONode:
             
             if t_curr > threshold:
                 c = args["c"]
-                # Look for embedding keys
                 for key in ["c_crossattn", "crossattn"]:
                     if key in c and isinstance(c[key], torch.Tensor):
                         current_emb = c[key]
@@ -141,15 +131,9 @@ class TPSONode:
                             new_c = c.copy()
                             new_emb = current_emb.clone()
                             
-                            # VALUE-BASED MATCHING
-                            # Instead of guessing indices, we replace parts that match our reference
-                            # This is robust to any batch ordering [Uncond, Cond] or [Cond, Uncond]
                             target_bs = final_optimized_cond.shape[0]
                             for i in range(current_emb.shape[0]):
-                                # Check if this slice matches the original positive prompt
-                                # We compare a small part for speed
                                 slice_to_check = current_emb[i:i+1]
-                                # Find which original prompt it belongs to (usually target_bs is 1)
                                 for j in range(target_bs):
                                     if torch.allclose(slice_to_check, ref_cond[j:j+1], atol=1e-3):
                                         new_emb[i] = final_optimized_cond[j]
