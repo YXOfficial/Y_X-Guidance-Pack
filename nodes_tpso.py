@@ -121,17 +121,20 @@ class TPSONode:
         # --- WRAPPER USING REFORGE ARCHITECTURE ---
         max_t = 999.0
         threshold = max_t * (1.0 - tpso_r)
-        
-        # COND = 0, UNCOND = 1 (Found in Test-reForge/ldm_patched/modules/samplers.py)
         COND_INDEX = 0
 
         def unet_wrapper(apply_model, args):
             t = args["timestep"]
             t_curr = t[0].item() if torch.is_tensor(t) else t
+            c = args["c"]
             
+            # FORCE DEBUG LOG ONCE
+            if not hasattr(unet_wrapper, "has_logged"):
+                logging.warning(f"TPSO DEBUG: Wrapper Called! t={t_curr:.2f} (Thresh={threshold:.2f}). Keys={list(c.keys())}")
+                unet_wrapper.has_logged = True
+
             # Check if we should inject (early steps)
             if t_curr > threshold:
-                c = args["c"]
                 cond_or_uncond = args.get("cond_or_uncond", [])
                 
                 # Identify which indices in the batch are Positive Prompts (COND)
@@ -140,9 +143,6 @@ class TPSONode:
                 
                 if cond_indices:
                     new_c = c.copy()
-                    
-                    # Target keys to replace
-                    # crossattn: SD1.5, c_crossattn: SDXL/Comfy
                     target_keys = ["c_crossattn", "crossattn"]
                     injected = False
                     
@@ -157,19 +157,20 @@ class TPSONode:
                                 for i, idx in enumerate(cond_indices):
                                     if idx < current_emb.shape[0]:
                                         # Map optimized prompts to batch indices
-                                        # If we have 1 optimized prompt, use index 0. 
-                                        # If we have N optimized prompts, map accordingly.
                                         opt_idx = i % final_optimized_cond.shape[0]
                                         new_emb[idx] = final_optimized_cond[opt_idx]
                                 
                                 new_c[key] = new_emb
                                 injected = True
+                                
+                                # Debug Injection success
+                                if not hasattr(unet_wrapper, "injected_logged"):
+                                    logging.warning(f"TPSO DEBUG: INJECTED into {key} at t={t_curr:.2f}")
+                                    unet_wrapper.injected_logged = True
                     
                     if injected:
-                        # Call original apply_model with MODIFIED conditioning
                         return apply_model(args["input"], args["timestep"], **new_c)
 
-            # Standard pass
             return apply_model(args["input"], args["timestep"], **args["c"])
 
         patched_unet = unet.clone()
