@@ -818,6 +818,11 @@ def make_guidance_axis_on_xyz_grid():
             type=float,
             apply=partial(set_guidance_value, feature="tpso", field="tpso_r"),
         ),
+        xyz_grid.AxisOption(
+            label="(TPSO) Kappa",
+            type=float,
+            apply=partial(set_guidance_value, feature="tpso", field="tpso_kappa"),
+        ),
     ]
     xyz_grid.axis_options.extend(options)
     logging.info("Guidance Pack: XYZ Grid options registered.")
