@@ -44,7 +44,6 @@ class TPSONode:
         dtype = devices.dtype_unet
         
         original_cond_tensor = None
-        # Extract Tensor Logic
         if isinstance(original_cond_obj, dict):
             for k in ['crossattn', 'c_crossattn', 'cond']:
                 if k in original_cond_obj:
@@ -68,11 +67,8 @@ class TPSONode:
         with torch.inference_mode(False):
             with torch.enable_grad():
                 target_cond_fp32 = original_cond_tensor.to(device, dtype=torch.float32).detach()
-                
-                # Kickstart noise
                 epsilon = torch.randn_like(target_cond_fp32) * 1e-2
                 epsilon.requires_grad_(True)
-                
                 optimizer = optim.Adam([epsilon], lr=real_lr)
                 
                 kappa = tpso_kappa
@@ -84,10 +80,8 @@ class TPSONode:
                     
                     v_prime = optimized_cond.view(batch_size, -1)
                     v = target_cond_fp32.view(batch_size, -1)
-                    
                     v_prime_norm = F.normalize(v_prime, p=2, dim=1)
                     v_norm = F.normalize(v, p=2, dim=1)
-                    
                     cos_sim = (v_prime_norm * v_norm).sum(dim=1)
                     
                     diff = torch.abs(cos_sim - kappa) - sigma
@@ -110,7 +104,6 @@ class TPSONode:
 
                 final_optimized_cond = (target_cond_fp32 + epsilon).to(dtype).detach()
 
-        # Final Verification
         with torch.no_grad():
             final_v_prime = F.normalize(final_optimized_cond.view(batch_size, -1).float(), p=2, dim=1)
             final_v = F.normalize(original_cond_tensor.view(batch_size, -1).float(), p=2, dim=1)
@@ -118,9 +111,9 @@ class TPSONode:
         
         logging.info(f"TPSO: Optimization Finished. Final Cosine Sim: {actual_sim:.4f} (Target: {kappa})")
 
-        # --- WRAPPER USING REFORGE ARCHITECTURE ---
-        max_t = 999.0
-        threshold = max_t * (1.0 - tpso_r)
+        # --- DYNAMIC WRAPPER ---
+        # State to store the detected max_t (start sigma)
+        wrapper_state = {"max_t": None}
         COND_INDEX = 0
 
         def unet_wrapper(apply_model, args):
@@ -128,17 +121,26 @@ class TPSONode:
             t_curr = t[0].item() if torch.is_tensor(t) else t
             c = args["c"]
             
+            # Dynamic Max T Detection (First Step)
+            if wrapper_state["max_t"] is None:
+                wrapper_state["max_t"] = float(t_curr)
+                logging.info(f"TPSO: Detected Start Sigma/Timestep = {t_curr:.2f}")
+
+            # Calculate threshold dynamically based on the REAL max_t
+            # threshold = start_t * (1 - r). 
+            # E.g. if start=14.6, r=0.4 => threshold = 14.6 * 0.6 = 8.76. 
+            # All steps with t > 8.76 will get injected.
+            max_t = wrapper_state["max_t"]
+            threshold = max_t * (1.0 - tpso_r)
+            
             # FORCE DEBUG LOG ONCE
             if not hasattr(unet_wrapper, "has_logged"):
-                logging.warning(f"TPSO DEBUG: Wrapper Called! t={t_curr:.2f} (Thresh={threshold:.2f}). Keys={list(c.keys())}")
+                logging.warning(f"TPSO DEBUG: Wrapper Called! t={t_curr:.2f}. Dynamic Threshold={threshold:.2f} (Max={max_t:.2f})")
                 unet_wrapper.has_logged = True
 
-            # Check if we should inject (early steps)
+            # Injection Logic
             if t_curr > threshold:
                 cond_or_uncond = args.get("cond_or_uncond", [])
-                
-                # Identify which indices in the batch are Positive Prompts (COND)
-                # cond_or_uncond is a list like [1, 0, 1, 0] where 0 is COND
                 cond_indices = [i for i, x in enumerate(cond_or_uncond) if x == COND_INDEX]
                 
                 if cond_indices:
@@ -149,21 +151,15 @@ class TPSONode:
                     for key in target_keys:
                         if key in c and isinstance(c[key], torch.Tensor):
                             current_emb = c[key]
-                            # Check compatibility (sequence length and dimension)
                             if current_emb.shape[-1] == final_optimized_cond.shape[-1]:
                                 new_emb = current_emb.clone()
-                                
-                                # Replace only at COND indices
                                 for i, idx in enumerate(cond_indices):
                                     if idx < current_emb.shape[0]:
-                                        # Map optimized prompts to batch indices
                                         opt_idx = i % final_optimized_cond.shape[0]
                                         new_emb[idx] = final_optimized_cond[opt_idx]
-                                
                                 new_c[key] = new_emb
                                 injected = True
                                 
-                                # Debug Injection success
                                 if not hasattr(unet_wrapper, "injected_logged"):
                                     logging.warning(f"TPSO DEBUG: INJECTED into {key} at t={t_curr:.2f}")
                                     unet_wrapper.injected_logged = True
