@@ -38,7 +38,7 @@ def sample_yx_4m_sde(model, x, sigmas, extra_args=None, callback=None, disable=N
 
             sde_diff = 0
             if h_3 is not None:
-                # 4th Order Extrapolation (4M)
+                # 4th Order Extrapolation (4M) - Using 4 points to estimate d1 and d2 more accurately
                 r0 = h_1 / h
                 r1 = h_2 / h
                 r2 = h_3 / h
@@ -46,13 +46,16 @@ def sample_yx_4m_sde(model, x, sigmas, extra_args=None, callback=None, disable=N
                 d1_1 = (denoised_1 - denoised_2) / r1
                 d1_2 = (denoised_2 - denoised_3) / r2
                 
+                # Extrapolate d1 (1st derivative) and d2 (2nd derivative)
                 d1 = d1_0 + (d1_0 - d1_1) * r2 / (r2 + r1) + ((d1_0 - d1_1) * r2 / (r2 + r1) - (d1_1 - d1_2) * r1 / (r0 + r1)) * r2 / ((r2 + r1) * (r0 + r1))
                 d2 = (d1_0 - d1_1) / (r2 + r1) + ((d1_0 - d1_1) * r2 / (r2 + r1) - (d1_1 - d1_2) * r1 / (r0 + r1)) / ((r2 + r1) * (r0 + r1))
                 
-                phi_3 = h_eta.neg().expm1() / h_eta + 1
-                phi_4 = phi_3 / h_eta - 0.5
+                # FIX: Must use phi_2 for d1 and phi_3 for d2, similar to 3M. 
+                # The previous use of phi_3/phi_4 was incorrect for the derivative order.
+                phi_2 = h_eta.neg().expm1() / h_eta + 1
+                phi_3 = phi_2 / h_eta - 0.5
                 
-                sde_diff = phi_3 * d1 - phi_4 * d2
+                sde_diff = phi_2 * d1 - phi_3 * d2
                 x = x + sde_diff
 
             elif h_2 is not None:
