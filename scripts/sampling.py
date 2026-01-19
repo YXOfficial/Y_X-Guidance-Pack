@@ -12,7 +12,7 @@ def sample_yx_4m_sde(model, x, sigmas, extra_args=None, callback=None, disable=N
 
     seed = extra_args.get("seed", None)
     if noise_sampler is None:
-        noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=seed, cpu=True)
+        noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=seed)
 
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
