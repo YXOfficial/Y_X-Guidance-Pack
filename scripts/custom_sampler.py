@@ -9,21 +9,33 @@ except ImportError:
     from modules.sd_samplers import KDiffusionSampler
 
 # ------------------------------------------------------------------------------
-# 1. Define your Custom Sampler Function
+# 1. Import your actual sampler function
 # ------------------------------------------------------------------------------
+try:
+    from scripts.sampling import sample_clyb_4m_sde_momentumized
+    HAS_CLYB = True
+except ImportError:
+    HAS_CLYB = False
+
 def sample_custom(model, x, sigmas, extra_args=None, callback=None, disable=None, noise_sampler=None):
     """
-    A custom sampler implementation.
-    Replace the logic below with your own sampling algorithm.
+    A custom sampler implementation using DPM++ 4M SDE Momentum.
     """
-    # This is a placeholder that calls Euler.
-    # TODO: Implement your custom sampling loop here.
-    return k_diffusion.sampling.sample_euler(
-        model, x, sigmas, 
-        extra_args=extra_args, 
-        callback=callback, 
-        disable=disable
-    )
+    if HAS_CLYB:
+        return sample_clyb_4m_sde_momentumized(
+            model, x, sigmas, 
+            extra_args=extra_args, 
+            callback=callback, 
+            disable=disable
+        )
+    else:
+        print("[CrazyDiffusion] Error: sample_clyb_4m_sde_momentumized not found in scripts.sampling. Falling back to Euler.")
+        return k_diffusion.sampling.sample_euler(
+            model, x, sigmas, 
+            extra_args=extra_args, 
+            callback=callback, 
+            disable=disable
+        )
 
 # ------------------------------------------------------------------------------
 # 2. Register the Sampler with SD WebUI
@@ -32,7 +44,7 @@ def add_custom_samplers():
     # List of samplers to add
     # Format: ( "Display Name", function_reference, ["alias1", "alias2"], {options} )
     new_samplers_config = [
-        ("Crazy Custom Sampler", sample_custom, ["k_crazy_custom"], {}),
+        ("DPM++ 4M SDE Momentum", sample_custom, ["k_dpmpp_4m_sde_momentum"], {}),
     ]
 
     # Get existing sampler names to prevent duplicates
