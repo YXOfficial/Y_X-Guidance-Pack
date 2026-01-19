@@ -1,48 +1,27 @@
 import torch
 from tqdm.auto import trange
-
-from k_diffusion.sampling import (
-    default_noise_sampler,
-)
-
+from k_diffusion.sampling import BrownianTreeNoiseSampler
 
 @torch.no_grad()
-def sample_clyb_4m_sde_momentumized(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1.0, s_noise=1., noise_sampler=None, momentum=0.0):
-    """DPM-Solver++(3M) SDE, modified with an extra SDE, and momentumized in both the SDE and ODE(?). 'its a first' - Clybius 2023
-    The expression for d1 is derived from the extrapolation formula given in the paper “Diffusion Monte Carlo with stochastic Hamiltonians” by M. Foulkes, L. Mitas, R. Needs, and G. Rajagopal. The formula is given as follows:
-    d1 = d1_0 + (d1_0 - d1_1) * r2 / (r2 + r1) + ((d1_0 - d1_1) * r2 / (r2 + r1) - (d1_1 - d1_2) * r1 / (r0 + r1)) * r2 / ((r2 + r1) * (r0 + r1))
-    (if this is an incorrect citing, we blame Google's Bard and OpenAI's ChatGPT for this and NOT me :^) )
-
-    where d1_0, d1_1, and d1_2 are defined as follows:
-    d1_0 = (denoised - denoised_1) / r2
-    d1_1 = (denoised_1 - denoised_2) / r1
-    d1_2 = (denoised_2 - denoised_3) / r0
-
-    The variables r0, r1, and r2 are defined as follows:
-    r0 = h_3 / h_2
-    r1 = h_2 / h
-    r2 = h / h_1
+def sample_yx_4m_sde(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1.0, s_noise=1., noise_sampler=None):
     """
-
-    def momentum_func(diff, velocity, timescale=1.0, offset=-momentum / 2.0): # Diff is current diff, vel is previous diff
-        if velocity is None:
-            momentum_vel = diff
-        else:
-            momentum_vel = momentum * (timescale + offset) * velocity + (1 - momentum * (timescale + offset)) * diff
-        return momentum_vel
-
+    YX 4M SDE: DPM-Solver++(3M) SDE extended to 4th order (4M).
+    Refactored to remove experimental momentum and use standard Brownian noise.
+    """
     sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
 
-    noise_sampler = default_noise_sampler(x) if noise_sampler is None else noise_sampler
+    seed = extra_args.get("seed", None)
+    if noise_sampler is None:
+        noise_sampler = BrownianTreeNoiseSampler(x, sigma_min, sigma_max, seed=seed, cpu=True)
 
     extra_args = {} if extra_args is None else extra_args
     s_in = x.new_ones([x.shape[0]])
 
     denoised_1, denoised_2, denoised_3 = None, None, None
     h_1, h_2, h_3 = None, None, None
-    vel, vel_sde = None, None
+    
     for i in trange(len(sigmas) - 1, disable=disable):
-        time = sigmas[i] / sigma_max
+        # time = sigmas[i] / sigma_max # Not needed without momentum
         denoised = model(x, sigmas[i] * s_in, **extra_args)
 
         if sigmas[i + 1] == 0:
@@ -52,55 +31,58 @@ def sample_clyb_4m_sde_momentumized(model, x, sigmas, extra_args=None, callback=
             t, s = -sigmas[i].log(), -sigmas[i + 1].log()
             h = s - t
             h_eta = h * (eta + 1)
-            x_diff = momentum_func((-h_eta).expm1().neg() * denoised, vel, time)
-            vel = x_diff
-            x = torch.exp(-h_eta) * x + vel
+            
+            # Standard Exponential Integrator update for ODE part
+            x_diff = (-h_eta).expm1().neg() * denoised
+            x = torch.exp(-h_eta) * x + x_diff
 
+            sde_diff = 0
             if h_3 is not None:
+                # 4th Order Extrapolation (4M)
                 r0 = h_1 / h
                 r1 = h_2 / h
                 r2 = h_3 / h
                 d1_0 = (denoised   - denoised_1) / r0
                 d1_1 = (denoised_1 - denoised_2) / r1
                 d1_2 = (denoised_2 - denoised_3) / r2
-                # d1 = d1_0 + (d1_0 - d1_1) * r0 / (r0 + r1) + ((d1_0 - d1_1) * r2 / (r1 + r2) - (d1_1 - d1_2) * r1 / (r0 + r1)) * r2 / ((r1 + r2) * (r0 + r1))
-                # d2 = (d1_0 - d1_1) / (r0 + r1) + ((d1_0 - d1_1) * r2 / (r1 + r2) - (d1_1 - d1_2) * r1 / (r0 + r1)) / ((r1 + r2) * (r0 + r1))
-
-                # r0 = h_3 / h_2
-                # r1 = h_2 / h
-                # r2 = h / h_1
-                # d1_0 = (denoised - denoised_1) / r2
-                # d1_1 = (denoised_1 - denoised_2) / r1
-                # d1_2 = (denoised_2 - denoised_3) / r0
+                
                 d1 = d1_0 + (d1_0 - d1_1) * r2 / (r2 + r1) + ((d1_0 - d1_1) * r2 / (r2 + r1) - (d1_1 - d1_2) * r1 / (r0 + r1)) * r2 / ((r2 + r1) * (r0 + r1))
                 d2 = (d1_0 - d1_1) / (r2 + r1) + ((d1_0 - d1_1) * r2 / (r2 + r1) - (d1_1 - d1_2) * r1 / (r0 + r1)) / ((r2 + r1) * (r0 + r1))
+                
                 phi_3 = h_eta.neg().expm1() / h_eta + 1
                 phi_4 = phi_3 / h_eta - 0.5
-                sde_diff = momentum_func(phi_3 * d1 - phi_4 * d2, vel_sde, time)
-                vel_sde = sde_diff
-                x = x + vel_sde
+                
+                sde_diff = phi_3 * d1 - phi_4 * d2
+                x = x + sde_diff
+
             elif h_2 is not None:
+                # 3rd Order (3M) warmup
                 r0 = h_1 / h
                 r1 = h_2 / h
                 d1_0 = (denoised - denoised_1) / r0
                 d1_1 = (denoised_1 - denoised_2) / r1
                 d1 = d1_0 + (d1_0 - d1_1) * r0 / (r0 + r1)
                 d2 = (d1_0 - d1_1) / (r0 + r1)
+                
                 phi_2 = h_eta.neg().expm1() / h_eta + 1
                 phi_3 = phi_2 / h_eta - 0.5
-                sde_diff = momentum_func(phi_2 * d1 - phi_3 * d2, vel_sde, time)
-                vel_sde = sde_diff
-                x = x + vel_sde
+                
+                sde_diff = phi_2 * d1 - phi_3 * d2
+                x = x + sde_diff
+
             elif h_1 is not None:
+                # 2nd Order (2M) warmup
                 r = h_1 / h
                 d = (denoised - denoised_1) / r
                 phi_2 = h_eta.neg().expm1() / h_eta + 1
-                sde_diff = momentum_func(phi_2 * d, vel_sde, time)
-                vel_sde = sde_diff
-                x = x + vel_sde
+                
+                sde_diff = phi_2 * d
+                x = x + sde_diff
 
             if eta:
-                x = x + noise_sampler(sigmas[i], sigmas[i + 1]) * sigmas[i + 1] * (-2 * h * eta).expm1().neg().sqrt() * s_noise
+                # SDE Noise Injection
+                noise = noise_sampler(sigmas[i], sigmas[i + 1])
+                x = x + noise * sigmas[i + 1] * (-2 * h * eta).expm1().neg().sqrt() * s_noise
 
             denoised_1, denoised_2, denoised_3 = denoised, denoised_1, denoised_2
             h_1, h_2, h_3 = h, h_1, h_2

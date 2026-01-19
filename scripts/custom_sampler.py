@@ -12,24 +12,24 @@ except ImportError:
 # 1. Import your actual sampler function
 # ------------------------------------------------------------------------------
 try:
-    from scripts.sampling import sample_clyb_4m_sde_momentumized
+    from scripts.sampling import sample_yx_4m_sde
     HAS_CLYB = True
 except ImportError:
     HAS_CLYB = False
 
 def sample_custom(model, x, sigmas, extra_args=None, callback=None, disable=None, noise_sampler=None):
     """
-    A custom sampler implementation using DPM++ 4M SDE Momentum.
+    A custom sampler implementation using YX 4M SDE.
     """
     if HAS_CLYB:
-        return sample_clyb_4m_sde_momentumized(
+        return sample_yx_4m_sde(
             model, x, sigmas, 
             extra_args=extra_args, 
             callback=callback, 
             disable=disable
         )
     else:
-        print("[CrazyDiffusion] Error: sample_clyb_4m_sde_momentumized not found in scripts.sampling. Falling back to Euler.")
+        print("[CrazyDiffusion] Error: sample_yx_4m_sde not found in scripts.sampling. Falling back to Euler.")
         return k_diffusion.sampling.sample_euler(
             model, x, sigmas, 
             extra_args=extra_args, 
@@ -44,7 +44,7 @@ def add_custom_samplers():
     # List of samplers to add
     # Format: ( "Display Name", function_reference, ["alias1", "alias2"], {options} )
     new_samplers_config = [
-        ("DPM++ 4M SDE Momentum", sample_custom, ["k_dpmpp_4m_sde_momentum"], {}),
+        ("YX 4M SDE", sample_custom, ["k_yx_4m_sde"], {}),
     ]
 
     # Get existing sampler names to prevent duplicates
