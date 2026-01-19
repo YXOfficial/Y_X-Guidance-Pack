@@ -14,6 +14,7 @@ class TPSOProcessor(GuidanceProcessor):
         self.tpso_lambda = 0.5
         self.tpso_r = 0.4
         self.tpso_kappa = 0.8
+        self.tpso_use_alpha = True
 
     def name(self) -> str:
         return "TPSO"
@@ -39,10 +40,11 @@ class TPSOProcessor(GuidanceProcessor):
                 label="Semantic Retention (Kappa)", minimum=0.5, maximum=1.0, step=0.01, value=self.tpso_kappa,
                 info="Target cosine similarity. Higher = more faithful to prompt, Lower = more diverse."
             )
-        return [tpso_enabled, tpso_steps, tpso_lr, tpso_lambda, tpso_r, tpso_kappa]
+            tpso_use_alpha = gr.Checkbox(label="Use Alpha Scheduler (Interpolation)", value=self.tpso_use_alpha)
+        return [tpso_enabled, tpso_steps, tpso_lr, tpso_lambda, tpso_r, tpso_kappa, tpso_use_alpha]
 
     def process(self, p, *args):
-        self.tpso_enabled, self.tpso_steps, self.tpso_lr, self.tpso_lambda, self.tpso_r, self.tpso_kappa = args
+        self.tpso_enabled, self.tpso_steps, self.tpso_lr, self.tpso_lambda, self.tpso_r, self.tpso_kappa, self.tpso_use_alpha = args
 
         xyz_settings = getattr(p, "_guidance_xyz", {})
         tpso_xyz = xyz_settings.get("tpso", {})
@@ -56,6 +58,8 @@ class TPSOProcessor(GuidanceProcessor):
             self.tpso_lambda = float(tpso_xyz["tpso_lambda"])
         if "tpso_r" in tpso_xyz:
             self.tpso_r = float(tpso_xyz["tpso_r"])
+        if "tpso_use_alpha" in tpso_xyz:
+            self.tpso_use_alpha = str(tpso_xyz["tpso_use_alpha"]).lower() == "true"
 
         if self.tpso_enabled:
             patched_unet = self.node.patch(
@@ -67,6 +71,7 @@ class TPSOProcessor(GuidanceProcessor):
                 tpso_lambda=self.tpso_lambda,
                 tpso_r=self.tpso_r,
                 tpso_kappa=self.tpso_kappa,
+                tpso_use_alpha=self.tpso_use_alpha,
             )[0]
             p.sd_model.forge_objects.unet = patched_unet
             p.extra_generation_params["TPSO Enabled"] = self.tpso_enabled
