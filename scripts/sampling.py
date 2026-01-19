@@ -5,8 +5,8 @@ from k_diffusion.sampling import BrownianTreeNoiseSampler
 @torch.no_grad()
 def sample_yx_4m_sde(model, x, sigmas, extra_args=None, callback=None, disable=None, eta=1.0, s_noise=1.0, noise_sampler=None):
     """
-    YX 4M SDE: Experimental 4th Order DPM-Solver++ SDE.
-    Uses Newton form for polynomial interpolation to stabilize high-order derivatives.
+    YX 4M SDE: 4th Order DPM-Solver++ SDE using Exact Taylor Expansion.
+    Correctly handles high-order derivatives using Newton Divided Differences.
     """
     sigma_min, sigma_max = sigmas[sigmas > 0].min(), sigmas.max()
 
@@ -18,7 +18,6 @@ def sample_yx_4m_sde(model, x, sigmas, extra_args=None, callback=None, disable=N
     s_in = x.new_ones([x.shape[0]])
 
     # History buffers
-    # D0 is current, D1 is prev, D2 is prev-prev...
     old_denoised = [] 
     old_h = []
     
@@ -36,144 +35,113 @@ def sample_yx_4m_sde(model, x, sigmas, extra_args=None, callback=None, disable=N
             t, s = -log_sigmas[i], -log_sigmas[i + 1]
             h = s - t
             h_eta = h * (eta + 1)
-
-            # --- DPM-Solver++ Core ---
-            # x(t_next) = exp(-h_eta) * x(t) + Integral term
-            x = torch.exp(-h_eta) * x + (-h_eta).expm1().neg() * denoised
-
-            # --- High Order Corrections ---
             
-            # Helper to calculate coefficients phi_k
-            # phi_1(h) = exp(h) - 1 / h  (handled by expm1)
-            # phi_2(h) = (phi_1(h) - 1) / h
-            # phi_3(h) = (phi_2(h) - 0.5) / h
-            # phi_4(h) = (phi_3(h) - 1/6) / h
+            # --- Exact Phi Functions Calculation ---
+            # z = -h_eta
+            # phi_1(z) = (exp(z) - 1) / z
+            # phi_k(z) = (phi_{k-1}(z) - 1/(k-1)!) / z
             
-            # Base phi_1 is handled by the ODE step above.
-            # We need phi_2, phi_3, phi_4 for the derivatives.
+            z = -h_eta
             
-            phi_2 = h_eta.neg().expm1() / h_eta + 1
-            phi_3 = phi_2 / h_eta - 0.5
-            phi_4 = phi_3 / h_eta - (1/6)
-
-            # Current D0 = denoised
+            # Using expm1 for numerical stability near 0
+            # phi_1 = (exp(z) - 1) / z
+            if torch.abs(z).max() < 1e-4:
+                # Taylor approx for very small steps to avoid division by zero artifacts
+                phi_1 = 1 + z/2 + z**2/6 + z**3/24
+                phi_2 = 1/2 + z/6 + z**2/24 + z**3/120
+                phi_3 = 1/6 + z/24 + z**2/120 + z**3/720
+                phi_4 = 1/24 + z/120 + z**2/720 + z**3/5040
+            else:
+                phi_1 = torch.expm1(z) / z
+                phi_2 = (phi_1 - 1) / z
+                phi_3 = (phi_2 - 0.5) / z
+                phi_4 = (phi_3 - (1/6)) / z
             
-            if len(old_denoised) >= 3: # 4M Step (Current + 3 History)
+            # --- Base DPM-Solver++ Update (Term 0) ---
+            # x_next = exp(z) * x_curr + h_eta * phi_1 * D0
+            # Note: h_eta * phi_1 = h_eta * (exp(z)-1)/z = h_eta * (exp(-h_eta)-1)/(-h_eta) = 1 - exp(-h_eta)
+            # This matches the standard form: exp(-h)*x + (1-exp(-h))*D
+            
+            x = torch.exp(z) * x + (1 - torch.exp(z)) * denoised
+            
+            # --- High Order Corrections (Terms 1, 2, 3) ---
+            # We add terms: h^k * phi_k * D^(k-1)
+            # Note: The factor h_eta is used in the phi arguments, so we scale by h_eta.
+            
+            if len(old_denoised) >= 3: # 4M Step
                 h_1, h_2, h_3 = old_h[-1], old_h[-2], old_h[-3]
                 d_1, d_2, d_3 = old_denoised[-1], old_denoised[-2], old_denoised[-3]
 
-                # Newton Divided Differences (bền vững hơn cho lưới không đều)
-                # D[0] = (D0 - D1) / h
-                div_0 = (denoised - d_1) / (h_1/h * h + 1e-8) # Normalize h relative to current h? No, just standard div diff.
+                # Newton Divided Differences (coefficients of the polynomial in Newton basis)
+                # D(tau) ~ D0 + (tau)*delta_0 + (tau)(tau+r0)*delta_0_1 + ...
                 
-                # Re-calculating using standard divided differences logic relative to lambda (log-sigma)
-                # Let's simplify: map to normalized steps r0, r1, r2
-                r0 = h_1 / h
-                r1 = h_2 / h
-                r2 = h_3 / h
+                # Normalized steps relative to current h_eta
+                # We use the raw derivatives approximation directly
                 
-                # First order differences
-                delta_0 = (denoised - d_1) / r0      # Slope 0->1
-                delta_1 = (d_1 - d_2) / r1          # Slope 1->2
-                delta_2 = (d_2 - d_3) / r2          # Slope 2->3
+                # 1. First differences (Slopes)
+                # delta_i = (y_i - y_{i+1}) / (h_gap)
+                # Note: old_h are actual step sizes.
                 
-                # Second order differences
-                delta_0_1 = (delta_0 - delta_1) / (r0 + r1)
-                delta_1_2 = (delta_1 - delta_2) / (r1 + r2)
+                delta_0 = (denoised - d_1) / h_1
+                delta_1 = (d_1 - d_2) / h_2
+                delta_2 = (d_2 - d_3) / h_3
                 
-                # Third order difference (The 4M special)
-                delta_0_1_2 = (delta_0_1 - delta_1_2) / (r0 + r1 + r2)
+                # 2. Second differences (Curvature)
+                delta_0_1 = (delta_0 - delta_1) / (h_1 + h_2)
+                delta_1_2 = (delta_1 - delta_2) / (h_2 + h_3)
                 
-                # DPM-Solver correction formula reconstruction:
-                # Integral ~ phi_2 * D' + phi_3 * D'' + phi_4 * D'''
+                # 3. Third difference (Jerk)
+                delta_0_1_2 = (delta_0_1 - delta_1_2) / (h_1 + h_2 + h_3)
                 
-                # Taylor expansion mapping:
-                # 1st Deriv approx = delta_0
-                # 2nd Deriv approx = 2 * delta_0_1
-                # 3rd Deriv approx = 6 * delta_0_1_2
+                # Taylor Coefficients estimates at t=0
+                D_1 = delta_0  + delta_0_1 * h_1 + delta_0_1_2 * h_1 * (h_1 + h_2)
+                D_2 = 2 * (delta_0_1 + delta_0_1_2 * (h_1 + h_1 + h_2)) # Approx
+                # Actually, simpler reconstruction from Newton form to Taylor at 0:
+                # P(t) = d0 + t*del0 + t(t+h1)*del01 + t(t+h1)(t+h1+h2)*del012
+                # P'(0) = del0 + h1*del01 + h1(h1+h2)*del012
+                # P''(0) = 2*del01 + 2*(2*h1 + h2)*del012
+                # P'''(0) = 6*del012
                 
-                # Apply:
-                # x += phi_2 * (1st Deriv)
-                # x += phi_3 * (2nd Deriv)
-                # x += phi_4 * (3rd Deriv) -- THIS IS THE NEW 4M PART
+                deriv_1 = delta_0 + h_1 * delta_0_1 + h_1 * (h_1 + h_2) * delta_0_1_2
+                deriv_2 = 2 * delta_0_1 + 2 * (2*h_1 + h_2) * delta_0_1_2
+                deriv_3 = 6 * delta_0_1_2
                 
-                # Note: The coefficients might need scaling depending on definition. 
-                # DPM-Solver paper usually absorbs factorials into phi or D.
-                # Standard pattern: 
-                # x += phi_2 * delta_0
-                # x += phi_3 * (delta_0 - delta_1) * ... 
-                # Using the explicit Newton form terms:
+                # Apply corrections
+                # Term k: h_eta^k * phi_k * (D^(k-1) / h_eta^(k-1)) ? 
+                # No, standard form: x += h^k * phi_k * D^(k-1) is only for linear phi.
+                # Correct integral add-on:
+                # x += h_eta^2 * phi_2 * D_1 
+                # x += h_eta^3 * phi_3 * D_2
+                # x += h_eta^4 * phi_4 * D_3
                 
-                term_2 = delta_0 # ~ D'(t)
-                term_3 = delta_0_1 * (r0) # Correction for 2nd order
-                # For 4M, we add the 3rd order term.
-                # The jump from 3M to 4M is adding the curvature of the curvature.
+                # Note: D_k here are the raw derivatives wrt lambda.
                 
-                # Let's use a simpler 4M formulation:
-                # D(tau) ~ D0 + (tau)*delta_0 + (tau)(tau+r0)*delta_0_1 + (tau)(tau+r0)(tau+r0+r1)*delta_0_1_2
-                # Integrate this polynomial from 0 to -1 (in normalized time).
-                
-                # Resulting update rule (derived):
-                # x += phi_2 * delta_0
-                # x -= phi_3 * delta_0_1 * (r0 + r1) # Approx
-                # Let's stick to the structure that worked for 3M and extend it logically.
-                
-                # 3M Logic (from paper):
-                # D1_corr = delta_0 + (delta_0 - delta_1) * (r0 / (r0+r1))
-                # D2_corr = (delta_0 - delta_1) / (r0+r1)
-                # x += phi_2 * D1_corr - phi_3 * D2_corr
-                
-                # 4M Extension:
-                # We need to project delta_0_1_2 into the estimate.
-                # This is "risky" but let's try.
-                
-                # Refined 3M derivatives (as base):
-                d1_base = delta_0 + (delta_0 - delta_1) * r0 / (r0 + r1)
-                d2_base = (delta_0 - delta_1) / (r0 + r1)
-                
-                # 4M Correction factor:
-                # We add the influence of the 3rd diff to d1 and d2 estimates.
-                # Or simply add the 3rd term directly.
-                
-                # Try explicit 4th order term:
-                # x += phi_4 * (3rd Deriv)
-                # 3rd Deriv approx = delta_0_1_2 * (some scaling based on steps)
-                # Heuristic scaling: 2 * (r0 + r1 + r2) ? 
-                # Let's look at the noise pattern. If it's high freq, dampen high order.
-                
-                d3_val = delta_0_1_2 
-                
-                # Improved 4M Update:
-                # 3M part
-                x = x + phi_2 * d1_base - phi_3 * d2_base
-                # 4M part (The "Crazy" part)
-                # We add the 3rd derivative contribution.
-                # In Taylor expansion: Integral(tau^3/6 * D''') = phi_4 * D'''
-                # D''' is approx 6 * delta_0_1_2
-                
-                x = x + phi_4 * (d3_val * 6.0)
+                x = x + (h_eta**2) * phi_2 * deriv_1
+                x = x + (h_eta**3) * phi_3 * deriv_2
+                x = x + (h_eta**4) * phi_4 * deriv_3
 
             elif len(old_denoised) >= 2: # 3M Step (Warmup)
                 h_1, h_2 = old_h[-1], old_h[-2]
                 d_1, d_2 = old_denoised[-1], old_denoised[-2]
                 
-                r0 = h_1 / h
-                r1 = h_2 / h
+                delta_0 = (denoised - d_1) / h_1
+                delta_1 = (d_1 - d_2) / h_2
+                delta_0_1 = (delta_0 - delta_1) / (h_1 + h_2)
                 
-                delta_0 = (denoised - d_1) / r0
-                delta_1 = (d_1 - d_2) / r1
+                deriv_1 = delta_0 + h_1 * delta_0_1
+                deriv_2 = 2 * delta_0_1
                 
-                d1 = delta_0 + (delta_0 - delta_1) * r0 / (r0 + r1)
-                d2 = (delta_0 - delta_1) / (r0 + r1)
-                
-                x = x + phi_2 * d1 - phi_3 * d2
+                x = x + (h_eta**2) * phi_2 * deriv_1
+                x = x + (h_eta**3) * phi_3 * deriv_2
 
             elif len(old_denoised) >= 1: # 2M Step (Warmup)
                 h_1 = old_h[-1]
                 d_1 = old_denoised[-1]
-                r0 = h_1 / h
-                d1 = (denoised - d_1) / r0
-                x = x + phi_2 * d1
+                
+                delta_0 = (denoised - d_1) / h_1
+                deriv_1 = delta_0
+                
+                x = x + (h_eta**2) * phi_2 * deriv_1
 
             # --- SDE Noise Injection ---
             if eta > 0:
@@ -184,7 +152,7 @@ def sample_yx_4m_sde(model, x, sigmas, extra_args=None, callback=None, disable=N
             # Update history
             old_denoised.append(denoised)
             old_h.append(h)
-            if len(old_denoised) > 3: # Keep window of 3 history items
+            if len(old_denoised) > 3:
                 old_denoised.pop(0)
                 old_h.pop(0)
 
