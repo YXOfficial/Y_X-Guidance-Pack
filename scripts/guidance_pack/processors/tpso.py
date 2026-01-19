@@ -79,7 +79,9 @@ class TPSOProcessor(GuidanceProcessor):
             p.extra_generation_params["TPSO LR"] = self.tpso_lr
             p.extra_generation_params["TPSO Lambda"] = self.tpso_lambda
             p.extra_generation_params["TPSO r"] = self.tpso_r
-            logging.debug("TPSO: Patch applied.")
+            p.extra_generation_params["TPSO Kappa"] = self.tpso_kappa
+            p.extra_generation_params["TPSO Use Alpha"] = self.tpso_use_alpha
+            logging.debug(f"TPSO: Patch applied. Alpha={self.tpso_use_alpha}")
 
     def register_xyz(self, xyz_grid, set_guidance_value_func):
         options = [
@@ -113,6 +115,12 @@ class TPSOProcessor(GuidanceProcessor):
                 label="(TPSO) Kappa",
                 type=float,
                 apply=partial(set_guidance_value_func, feature="tpso", field="tpso_kappa"),
+            ),
+            xyz_grid.AxisOption(
+                label="(TPSO) Use Alpha",
+                type=str,
+                apply=partial(set_guidance_value_func, feature="tpso", field="tpso_use_alpha"),
+                choices=lambda: ["True", "False"],
             ),
         ]
         xyz_grid.axis_options.extend(options)
