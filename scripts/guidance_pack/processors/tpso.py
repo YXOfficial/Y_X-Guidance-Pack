@@ -46,6 +46,15 @@ class TPSOProcessor(GuidanceProcessor):
     def process(self, p, *args):
         self.tpso_enabled, self.tpso_steps, self.tpso_lr, self.tpso_lambda, self.tpso_r, self.tpso_kappa, self.tpso_use_alpha = args
 
+        # Safe boolean conversion
+        def to_bool(x):
+            if isinstance(x, str):
+                return x.lower() in ("true", "1", "yes", "on")
+            return bool(x)
+
+        self.tpso_enabled = to_bool(self.tpso_enabled)
+        self.tpso_use_alpha = to_bool(self.tpso_use_alpha)
+
         xyz_settings = getattr(p, "_guidance_xyz", {})
         tpso_xyz = xyz_settings.get("tpso", {})
         if "tpso_enabled" in tpso_xyz:
