@@ -18,15 +18,16 @@ class TPSONode:
                 "tpso_lambda": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 10.0, "step": 0.1}),
                 "tpso_r": ("FLOAT", {"default": 0.4, "min": 0.0, "max": 1.0, "step": 0.05}),
                 "tpso_kappa": ("FLOAT", {"default": 0.8, "min": 0.1, "max": 0.99, "step": 0.01}),
+                "tpso_use_alpha": ("BOOLEAN", {"default": True}),
             }
         }
 
     RETURN_TYPES = ("MODEL",)
     FUNCTION = "patch"
     CATEGORY = "advanced/model_patches"
-    DESCRIPTION = "Training-Free Prompt Semantic Space Optimization (TPSO) - Faithful Implementation."
+    DESCRIPTION = "Training-Free Prompt Semantic Space Optimization (TPSO)"
 
-    def patch(self, unet, p, tpso_enabled=False, tpso_steps=20, tpso_lr=0.1, tpso_lambda=1.0, tpso_r=0.4, tpso_kappa=0.8):
+    def patch(self, unet, p, tpso_enabled=False, tpso_steps=20, tpso_lr=0.1, tpso_lambda=1.0, tpso_r=0.4, tpso_kappa=0.8, tpso_use_alpha=True):
         if not tpso_enabled:
             return (unet,)
 
@@ -144,6 +145,14 @@ class TPSONode:
                 cond_indices = [i for i, x in enumerate(cond_or_uncond) if x == COND_INDEX]
                 
                 if cond_indices:
+                    # Calculate alpha for interpolation (Eq 11 from paper)
+                    # alpha = (t - T(1-r)) / (rT) -> (t - threshold) / (max_t - threshold)
+                    denom = max_t - threshold
+                    alpha = 1.0
+                    if denom > 1e-5:
+                        alpha = (t_curr - threshold) / denom
+                        alpha = max(0.0, min(1.0, alpha))
+                    
                     new_c = c.copy()
                     target_keys = ["c_crossattn", "crossattn"]
                     injected = False
@@ -156,12 +165,21 @@ class TPSONode:
                                 for i, idx in enumerate(cond_indices):
                                     if idx < current_emb.shape[0]:
                                         opt_idx = i % final_optimized_cond.shape[0]
-                                        new_emb[idx] = final_optimized_cond[opt_idx]
+                                        optimized_val = final_optimized_cond[opt_idx]
+                                        
+                                        if tpso_use_alpha:
+                                            # Interpolate: y* = alpha * y' + (1 - alpha) * y
+                                            original_val = current_emb[idx]
+                                            new_emb[idx] = alpha * optimized_val + (1.0 - alpha) * original_val
+                                        else:
+                                            # Direct replacement (User's request)
+                                            new_emb[idx] = optimized_val
+
                                 new_c[key] = new_emb
                                 injected = True
                                 
                                 if not hasattr(unet_wrapper, "injected_logged"):
-                                    logging.warning(f"TPSO DEBUG: INJECTED into {key} at t={t_curr:.2f}")
+                                    logging.warning(f"TPSO DEBUG: INJECTED into {key} at t={t_curr:.2f} with alpha={alpha:.4f}")
                                     unet_wrapper.injected_logged = True
                     
                     if injected:
