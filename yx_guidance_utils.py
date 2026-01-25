@@ -360,7 +360,7 @@ def make_zeresfdg_base_builder() -> Callable:
         negative_flat = uncond_denoised.reshape(batch_size, -1)
         dot_product = torch.sum(positive_flat * negative_flat, dim=1, keepdim=True)
         squared_norm_negative = torch.sum(negative_flat ** 2, dim=1, keepdim=True) + 1e-8
-        alpha_parallel = dot_product / squared_norm_negative
+        alpha_parallel = torch.clamp(dot_product / squared_norm_negative, min=0.0)
         alpha_parallel = alpha_parallel.view(batch_size, *([1] * (len(original_shape) - 1)))
         base_pred = uncond_denoised * alpha_parallel
         residual = cond_denoised - base_pred
@@ -504,19 +504,28 @@ def make_zeresfdg_modifier(
         
         # FDG(delta) = w_low * dl + w_high * dh
         fdg_zero = w_low * dl_zero + w_high * dh_zero
-        fdg_zero = apply_mask(fdg_zero, guidance_mask)
+        if guidance_mask is not None:
+            fdg_zero = apply_mask(fdg_zero, guidance_mask)
         
         # Paper Algorithm 1 Line 13: Rescale(u_proj + FDG(delta), std(yc))
         y_zero_raw = u_proj + fdg_zero
         y_zero_std = y_zero_raw.std(dim=dims, keepdim=True)
         y_zero = y_zero_raw * (target_std / (y_zero_std + eps))
         
-        # --- BRANCH 2: Rescale (Detail-seeking) ---
-        # Paper Algorithm 1 Line 16: y_cfg = yu + s * FDG(yc - yu)
-        fdg_rescale = w_low * dl_rescale + w_high * dh_rescale
-        fdg_rescale = apply_mask(fdg_rescale, guidance_mask)
+        # Normalize Branch 1 for the outer pipeline
+        if abs(cond_scale) > 1e-6:
+            guidance_z = (y_zero - u_proj) / cond_scale
+        else:
+            guidance_z = torch.zeros_like(y_zero)
         
-        y_cfg = uncond_denoised + cond_scale * fdg_rescale
+        # --- BRANCH 2: Rescale (Detail-seeking) ---
+        # Paper Algorithm 1 Line 16: y_cfg = yu + 1.0 * FDG(yc - yu)
+        # We use 1.0 instead of cond_scale to provide a normalized guidance direction.
+        fdg_rescale = w_low * dl_rescale + w_high * dh_rescale
+        if guidance_mask is not None:
+            fdg_rescale = apply_mask(fdg_rescale, guidance_mask)
+        
+        y_cfg = uncond_denoised + fdg_rescale
         y_cfg_std = y_cfg.std(dim=dims, keepdim=True)
         y_cfg_rescaled = y_cfg * (target_std / (y_cfg_std + eps))
         
@@ -524,11 +533,11 @@ def make_zeresfdg_modifier(
         y_rescale = alpha * y_cfg_rescaled + (1.0 - alpha) * y_cfg
         
         # --- FINAL SELECTION ---
-        final_output = (1.0 - m) * y_zero + m * y_rescale
-        
-        # Split back to base/guidance for the pipeline
+        # Both branches are now normalized so that: Output = Base + Scale * Guidance
         final_base = (1.0 - m) * u_proj + m * uncond_denoised
-        final_guidance = final_output - final_base
+        
+        guidance_r = y_rescale - uncond_denoised
+        final_guidance = (1.0 - m) * guidance_z + m * guidance_r
 
         logging.info(f"ZeResFDG | rho:{rho.mean().item():.4f} | r_hf:{r_hf.mean().item():.4f} | Mode:{'RESCALE' if m.mean() > 0.5 else 'ZERO'}")
         return GuidanceState(final_base, final_guidance)
