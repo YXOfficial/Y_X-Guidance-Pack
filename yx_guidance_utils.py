@@ -469,55 +469,68 @@ def make_zeresfdg_modifier(
         uncond_denoised = args["uncond_denoised"]
         guidance_mask = args.get("guidance_mask") or args.get("mask") or args.get("g")
 
-        # 1. FDG: Delta = yc - yu
-        delta = cond_denoised - uncond_denoised
-        delta_l = gaussian_lowpass(delta)
-        delta_h = delta - delta_l
-
-        # 2. Spectral Controller (Energy Sum of Squares)
-        batch_size = delta.shape[0]
-        d_l_f = delta_l.reshape(batch_size, -1).to(torch.float32)
-        d_h_f = delta_h.reshape(batch_size, -1).to(torch.float32)
-        l_energy = torch.sum(d_l_f ** 2, dim=1)
-        h_energy = torch.sum(d_h_f ** 2, dim=1)
-        r_hf = h_energy / (l_energy + h_energy + eps)
+        # 1. FDG Preparation (yc - yu)
+        delta_rescale = cond_denoised - uncond_denoised
+        dl_rescale = gaussian_lowpass(delta_rescale)
+        dh_rescale = delta_rescale - dl_rescale
+        
+        # Spectral Controller Input (r_hf) using Energy (Sum of Squares)
+        batch_size = cond_denoised.shape[0]
+        dims = tuple(range(1, cond_denoised.dim()))
+        
+        low_energy = torch.sum(dl_rescale.reshape(batch_size, -1).to(torch.float32) ** 2, dim=1)
+        high_energy = torch.sum(dh_rescale.reshape(batch_size, -1).to(torch.float32) ** 2, dim=1)
+        r_hf = high_energy / (low_energy + high_energy + eps)
         r_hf = r_hf.to(cond_denoised.dtype)
-
+        
         # EMA Update: rho = beta * rho + (1 - beta) * r_hf
         if rho is None or rho.shape != r_hf.shape:
             rho = r_hf.detach()
         else:
             rho = beta * rho + (1 - beta) * r_hf.detach()
-
+            
         mode = update_mode(rho)
         m = mode.to(dtype=cond_denoised.dtype).view(batch_size, *([1] * (cond_denoised.dim() - 1)))
+        
+        target_std = cond_denoised.std(dim=dims, keepdim=True)
 
-        # 3. Path Calculation
-        # Path A: Conservative (CFG-Zero based)
-        if cond_scale != 0:
-            res = state.guidance_term / cond_scale
-        else:
-            res = state.guidance_term
-        res_l = gaussian_lowpass(res)
-        res_h = res - res_l
-        y_cons = state.base_prediction + (w_low * res_l + w_high * res_h) * cond_scale
-        y_cons = apply_mask(y_cons, guidance_mask) # Simplified for clarity
-
-        # Path B: Detail-seeking (Rescale based)
-        y_cfg = uncond_denoised + cond_scale * (w_low * delta_l + w_high * delta_h)
-        y_cfg = apply_mask(y_cfg, guidance_mask)
-        dims = tuple(range(1, cond_denoised.dim()))
-        t_std = cond_denoised.std(dim=dims, keepdim=True)
-        c_std = y_cfg.std(dim=dims, keepdim=True)
-        r_fac = t_std / (c_std + eps)
-        y_det = alpha * (y_cfg * r_fac) + (1.0 - alpha) * y_cfg
-
-        # Final Blending
-        final_output = (1.0 - m) * y_cons + m * y_det
-        final_base = (1.0 - m) * state.base_prediction + m * uncond_denoised
+        # --- BRANCH 1: Zero-Projection (Conservative) ---
+        # Paper: delta = yc - alpha_parallel * yu
+        # state.base_prediction already holds (alpha_parallel * yu)
+        u_proj = state.base_prediction
+        delta_zero = cond_denoised - u_proj
+        dl_zero = gaussian_lowpass(delta_zero)
+        dh_zero = delta_zero - dl_zero
+        
+        # FDG(delta) = w_low * dl + w_high * dh
+        fdg_zero = w_low * dl_zero + w_high * dh_zero
+        fdg_zero = apply_mask(fdg_zero, guidance_mask)
+        
+        # Paper Algorithm 1 Line 13: Rescale(u_proj + FDG(delta), std(yc))
+        y_zero_raw = u_proj + fdg_zero
+        y_zero_std = y_zero_raw.std(dim=dims, keepdim=True)
+        y_zero = y_zero_raw * (target_std / (y_zero_std + eps))
+        
+        # --- BRANCH 2: Rescale (Detail-seeking) ---
+        # Paper Algorithm 1 Line 16: y_cfg = yu + s * FDG(yc - yu)
+        fdg_rescale = w_low * dl_rescale + w_high * dh_rescale
+        fdg_rescale = apply_mask(fdg_rescale, guidance_mask)
+        
+        y_cfg = uncond_denoised + cond_scale * fdg_rescale
+        y_cfg_std = y_cfg.std(dim=dims, keepdim=True)
+        y_cfg_rescaled = y_cfg * (target_std / (y_cfg_std + eps))
+        
+        # Paper Equation (1): alpha * Rescale(y_cfg) + (1 - alpha) * y_cfg
+        y_rescale = alpha * y_cfg_rescaled + (1.0 - alpha) * y_cfg
+        
+        # --- FINAL SELECTION ---
+        final_output = (1.0 - m) * y_zero + m * y_rescale
+        
+        # Split back to base/guidance for the pipeline
+        final_base = (1.0 - m) * u_proj + m * uncond_denoised
         final_guidance = final_output - final_base
 
-        logging.info(f"ZeResFDG | rho:{rho.mean().item():.4f} | r_hf:{r_hf.mean().item():.4f} | Mode:{'RESCALE' if mode.any() else 'ZERO'}")
+        logging.info(f"ZeResFDG | rho:{rho.mean().item():.4f} | r_hf:{r_hf.mean().item():.4f} | Mode:{'RESCALE' if m.mean() > 0.5 else 'ZERO'}")
         return GuidanceState(final_base, final_guidance)
 
     return modifier
