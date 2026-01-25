@@ -496,11 +496,6 @@ def make_zeresfdg_modifier(
         target_std = cond_denoised.std(dim=dims, keepdim=True)
 
         # --- BRANCH 1: ZERO (Conservative / Zero-Projection) ---
-        # Algorithm 1 Step 4: No Rescale here.
-        # Base = u_proj (alpha_parallel * yu)
-        # Target y = Base + s * FDG(r)
-        # Therefore, Guidance = FDG(r)
-        
         u_proj = state.base_prediction
         delta_z = cond_denoised - u_proj
         dl_z = gaussian_lowpass(delta_z)
@@ -510,12 +505,11 @@ def make_zeresfdg_modifier(
         if g_mask is not None: 
             fdg_z = fdg_z * g_mask
             
-        # Direct assignment, no scaling or rescaling logic needed for guidance term
-        guidance_z = fdg_z
+        # GuidanceState simply adds base + guidance.
+        # So we MUST multiply by cond_scale here to get the correct magnitude.
+        guidance_z = fdg_z * cond_scale
         
         # --- BRANCH 2: RESCALE (Detail-seeking) ---
-        # Algorithm 1 Step 5: Rescale is applied here.
-        
         # 1. Simulate y_cfg = yu + s * FDG(yc - yu)
         fdg_rescale = w_low * dl_rescale + w_high * dh_rescale
         if g_mask is not None: 
@@ -525,18 +519,16 @@ def make_zeresfdg_modifier(
         
         # 2. Rescale & Blend
         y_cfg_std = y_cfg_sim.std(dim=dims, keepdim=True)
-        # Safety: avoid div by zero
         r_factor = target_std / (y_cfg_std + eps)
         y_cfg_rescaled = y_cfg_sim * r_factor
         
         y_target_rescale = alpha * y_cfg_rescaled + (1.0 - alpha) * y_cfg_sim
         
-        # 3. Reverse-Engineer Guidance
-        # y_target = yu + s * guidance_r  =>  guidance_r = (y_target - yu) / s
-        if abs(cond_scale) > 1e-6:
-            guidance_r = (y_target_rescale - uncond_denoised) / cond_scale
-        else:
-            guidance_r = torch.zeros_like(y_target_rescale)
+        # 3. Calculate Guidance Term
+        # We need (Base + Guidance) = y_target
+        # Since Base for Rescale mode is uncond_denoised,
+        # Guidance = y_target - uncond_denoised
+        guidance_r = y_target_rescale - uncond_denoised
 
         # --- BLENDING ---
         # Final Base switches between u_proj (Zero mode) and yu (Rescale mode)
