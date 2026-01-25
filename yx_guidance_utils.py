@@ -549,11 +549,6 @@ def make_zeresfdg_modifier(
         logging.info(f"ZeResFDG | rho:{rho.mean().item():.4f} | r_hf:{r_hf.mean().item():.4f} | Mode:{'RESCALE' if m.mean() > 0.5 else 'ZERO'}")
         return GuidanceState(final_base, final_guidance)
 
-        logging.info(f"ZeResFDG | rho:{rho.mean().item():.4f} | r_hf:{r_hf.mean().item():.4f} | Mode:{'RESCALE' if m.mean() > 0.5 else 'ZERO'}")
-        return GuidanceState(final_base, final_guidance)
-
-    return modifier
-
     return modifier
 
 
