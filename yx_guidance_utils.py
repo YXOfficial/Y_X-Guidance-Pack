@@ -468,6 +468,7 @@ def make_zeresfdg_modifier(
         cond_denoised = args["cond_denoised"]
         uncond_denoised = args["uncond_denoised"]
         guidance_mask = args.get("guidance_mask") or args.get("mask") or args.get("g")
+        g_mask = ensure_mask(guidance_mask, cond_denoised)
 
         # 1. FDG Preparation (yc - yu)
         delta_rescale = cond_denoised - uncond_denoised
