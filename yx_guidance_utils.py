@@ -516,14 +516,18 @@ def make_zeresfdg_modifier(
         mode = update_mode(rho)
         
         # Mandatory transparency: Log the internal state to console
-        logging.info(f"ZeResFDG Status | r_hf: {r_hf.mean().item():.4f} | rho (EMA): {rho.mean().item():.4f} | Mode: {'RescaleFDG (Alpha Active)' if mode.any() else 'CFGZeroFD (Conservative)'}")
+        current_mode_name = 'RescaleFDG (Alpha Active)' if mode.any() else 'CFGZeroFD (Conservative)'
+        logging.info(f"ZeResFDG Status | r_hf: {r_hf.mean().item():.4f} | rho (EMA): {rho.mean().item():.4f} | Mode: {current_mode_name}")
 
+        # 1. Conservative Path (CFG-Zero + FDG)
         residual_low = gaussian_lowpass(residual)
         residual_high = residual - residual_low
         fdg_residual = w_low * residual_low + w_high * residual_high
         fdg_residual = apply_mask(fdg_residual, guidance_mask)
-        conservative_term = fdg_residual * cond_scale
+        conservative_guidance = fdg_residual * cond_scale
+        conservative_base = state.base_prediction
 
+        # 2. Detail-seeking Path (Rescale + FDG)
         fdg_delta = w_low * delta_low + w_high * delta_high
         fdg_delta = apply_mask(fdg_delta, guidance_mask)
         y_cfg = uncond_denoised + cond_scale * fdg_delta
@@ -534,14 +538,20 @@ def make_zeresfdg_modifier(
         rescale_factor = torch.where(y_cfg_std > 0, target_std / (y_cfg_std + eps), torch.ones_like(target_std))
         y_rescaled = y_cfg * rescale_factor
         rescaled_prediction = alpha * y_rescaled + (1 - alpha) * y_cfg
-        rescale_term = rescaled_prediction - state.base_prediction
+        
+        # In Rescale mode, the base MUST be uncond_denoised as per Algorithm 1
+        rescale_guidance = rescaled_prediction - uncond_denoised
+        rescale_base = uncond_denoised
 
+        # 3. Dynamic Switching
         if mode.dtype != torch.bool:
             mode = mode > 0
-        mode_expanded = mode.view(batch_size, *([1] * (rescale_term.dim() - 1)))
-        combined_guidance = rescale_term * mode_expanded + conservative_term * (~mode_expanded)
+        mode_expanded = mode.view(batch_size, *([1] * (rescaled_prediction.dim() - 1)))
+        
+        final_base = torch.where(mode_expanded, rescale_base, conservative_base)
+        final_guidance = torch.where(mode_expanded, rescale_guidance, conservative_guidance)
 
-        return GuidanceState(state.base_prediction, combined_guidance)
+        return GuidanceState(final_base, final_guidance)
 
     return modifier
 
