@@ -519,25 +519,29 @@ def make_zeresfdg_modifier(
             guidance_z = torch.zeros_like(y_zero)
         
         # --- BRANCH 2: Rescale (Detail-seeking) ---
-        # Paper Algorithm 1 Line 16: y_cfg = yu + 1.0 * FDG(yc - yu)
-        # We use 1.0 instead of cond_scale to provide a normalized guidance direction.
+        # 1. Simulate the full CFG effect (High Contrast / Potential Burn)
         fdg_rescale = w_low * dl_rescale + w_high * dh_rescale
         if guidance_mask is not None:
             fdg_rescale = apply_mask(fdg_rescale, guidance_mask)
         
-        y_cfg = uncond_denoised + fdg_rescale
-        y_cfg_std = y_cfg.std(dim=dims, keepdim=True)
-        y_cfg_rescaled = y_cfg * (target_std / (y_cfg_std + eps))
+        # y_cfg must reflect the ACTUAL projected image at the current scale
+        y_cfg_sim = uncond_denoised + cond_scale * fdg_rescale
         
-        # Paper Equation (1): alpha * Rescale(y_cfg) + (1 - alpha) * y_cfg
-        y_rescale = alpha * y_cfg_rescaled + (1.0 - alpha) * y_cfg
+        # 2. Apply Rescale to the high-contrast simulation
+        y_cfg_std = y_cfg_sim.std(dim=dims, keepdim=True)
+        y_cfg_rescaled = y_cfg_sim * (target_std / (y_cfg_std + eps))
         
-        # --- FINAL SELECTION ---
-        # Both branches are now normalized so that: Output = Base + Scale * Guidance
-        final_base = (1.0 - m) * u_proj + m * uncond_denoised
+        # 3. Alpha Blend
+        y_target_rescale = alpha * y_cfg_rescaled + (1.0 - alpha) * y_cfg_sim
         
-        guidance_r = y_rescale - uncond_denoised
-        final_guidance = (1.0 - m) * guidance_z + m * guidance_r
+        # 4. Reverse-Engineer the Guidance Vector
+        # Output = Uncond + Scale * Guidance  =>  Guidance = (Output - Uncond) / Scale
+        if abs(cond_scale) > 1e-6:
+            guidance_r = (y_target_rescale - uncond_denoised) / cond_scale
+        else:
+            guidance_r = torch.zeros_like(y_target_rescale)
+
+        # --- BLENDING ---
 
         logging.info(f"ZeResFDG | rho:{rho.mean().item():.4f} | r_hf:{r_hf.mean().item():.4f} | Mode:{'RESCALE' if m.mean() > 0.5 else 'ZERO'}")
         return GuidanceState(final_base, final_guidance)
