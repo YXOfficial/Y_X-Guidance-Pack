@@ -496,7 +496,17 @@ def make_zeresfdg_modifier(
         target_std = cond_denoised.std(dim=dims, keepdim=True)
 
         # --- BRANCH 1: ZERO (Conservative / Zero-Projection) ---
-        u_proj = state.base_prediction
+        # Explicitly calculate projection here to be safe (ignore external base_builder)
+        # alpha_parallel = <yc, yu> / <yu, yu>
+        flat_c = cond_denoised.reshape(batch_size, -1)
+        flat_u = uncond_denoised.reshape(batch_size, -1)
+        dot_prod = torch.sum(flat_c * flat_u, dim=1, keepdim=True)
+        norm_sq = torch.sum(flat_u ** 2, dim=1, keepdim=True) + eps
+        alpha_par = torch.clamp(dot_prod / norm_sq, min=0.0)
+        alpha_par = alpha_par.view(batch_size, *([1] * (cond_denoised.dim() - 1)))
+        
+        u_proj = uncond_denoised * alpha_par
+        
         delta_z = cond_denoised - u_proj
         dl_z = gaussian_lowpass(delta_z)
         dh_z = delta_z - dl_z
