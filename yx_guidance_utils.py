@@ -426,18 +426,28 @@ def make_zeresfdg_modifier(
     mode_state = None
 
     def gaussian_lowpass(tensor: torch.Tensor) -> torch.Tensor:
-        if tensor.dim() != 4:
+        input_dim = tensor.dim()
+        if input_dim not in (3, 4):
             return tensor
+        
+        x = tensor
+        if input_dim == 3:
+            x = x.unsqueeze(0)
+            
         kernel_size = int(max(3, 2 * round(3 * sigma) + 1))
         if kernel_size % 2 == 0:
             kernel_size += 1
+            
         try:
-            return gaussian_blur2d(
-                tensor,
+            out = gaussian_blur2d(
+                x,
                 kernel_size=(kernel_size, kernel_size),
                 sigma=(sigma, sigma),
                 border_type="reflect",
             )
+            if input_dim == 3:
+                out = out.squeeze(0)
+            return out
         except Exception as e:
             logging.error(f"ZeResFDG: Gaussian blur failed with error {e}; skipping blur.")
             return tensor
