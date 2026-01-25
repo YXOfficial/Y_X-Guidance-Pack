@@ -378,33 +378,29 @@ def make_fdg_modifier(w_low: float, w_high: float, fdg_levels: int) -> Callable:
         else:
             guidance_direction = state.guidance_term
 
-        try:
-            guidance_low_freq_scaled = guidance_direction * w_low
-            guidance_high_freq_scaled = guidance_direction * w_high
-            levels = max(2, int(fdg_levels))
-            low_freq_part_from_low = build_laplacian_pyramid(guidance_low_freq_scaled, levels)[-1]
-            low_freq_part_from_high = build_laplacian_pyramid(guidance_high_freq_scaled, levels)[-1]
+        guidance_low_freq_scaled = guidance_direction * w_low
+        guidance_high_freq_scaled = guidance_direction * w_high
+        levels = max(2, int(fdg_levels))
+        low_freq_part_from_low = build_laplacian_pyramid(guidance_low_freq_scaled, levels)[-1]
+        low_freq_part_from_high = build_laplacian_pyramid(guidance_high_freq_scaled, levels)[-1]
 
-            if low_freq_part_from_high.shape != guidance_high_freq_scaled.shape:
-                low_freq_part_from_high = torch.nn.functional.interpolate(
-                    low_freq_part_from_high,
-                    size=guidance_high_freq_scaled.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
-            if low_freq_part_from_low.shape != guidance_high_freq_scaled.shape:
-                low_freq_part_from_low = torch.nn.functional.interpolate(
-                    low_freq_part_from_low,
-                    size=guidance_high_freq_scaled.shape[-2:],
-                    mode="bilinear",
-                    align_corners=False,
-                )
+        if low_freq_part_from_high.shape != guidance_high_freq_scaled.shape:
+            low_freq_part_from_high = torch.nn.functional.interpolate(
+                low_freq_part_from_high,
+                size=guidance_high_freq_scaled.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        if low_freq_part_from_low.shape != guidance_high_freq_scaled.shape:
+            low_freq_part_from_low = torch.nn.functional.interpolate(
+                low_freq_part_from_low,
+                size=guidance_high_freq_scaled.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
 
-            high_freq_part = guidance_high_freq_scaled - low_freq_part_from_high
-            final_guidance_term = (high_freq_part + low_freq_part_from_low) * cond_scale
-        except Exception as e:
-            logging.error(f"FDG: Error during frequency blending: {e}. Falling back to standard guidance.")
-            final_guidance_term = state.guidance_term
+        high_freq_part = guidance_high_freq_scaled - low_freq_part_from_high
+        final_guidance_term = (high_freq_part + low_freq_part_from_low) * cond_scale
 
         return GuidanceState(state.base_prediction, final_guidance_term)
 
@@ -427,30 +423,24 @@ def make_zeresfdg_modifier(
 
     def gaussian_lowpass(tensor: torch.Tensor) -> torch.Tensor:
         input_dim = tensor.dim()
-        if input_dim not in (3, 4):
-            return tensor
-        
-        x = tensor
         if input_dim == 3:
-            x = x.unsqueeze(0)
+            x = tensor.unsqueeze(0)
+        elif input_dim == 4:
+            x = tensor
+        else:
+            raise ValueError(f"ZeResFDG: Expected 3D or 4D tensor, got {input_dim}D (shape: {tensor.shape})")
             
         kernel_size = int(max(3, 2 * round(3 * sigma) + 1))
         if kernel_size % 2 == 0:
             kernel_size += 1
             
-        try:
-            out = gaussian_blur2d(
-                x,
-                kernel_size=(kernel_size, kernel_size),
-                sigma=(sigma, sigma),
-                border_type="reflect",
-            )
-            if input_dim == 3:
-                out = out.squeeze(0)
-            return out
-        except Exception as e:
-            logging.error(f"ZeResFDG: Gaussian blur failed with error {e}; skipping blur.")
-            return tensor
+        out = gaussian_blur2d(
+            x,
+            kernel_size=(kernel_size, kernel_size),
+            sigma=(sigma, sigma),
+            border_type="reflect",
+        )
+        return out.squeeze(0) if input_dim == 3 else out
 
     def ensure_mask(mask, target: torch.Tensor) -> torch.Tensor:
         if mask is None:
@@ -490,8 +480,11 @@ def make_zeresfdg_modifier(
 
         if mode_state is None or mode_state.shape != ratio.shape:
             mode_state = ratio > tau_hi
-        mode_state = torch.where(ratio > tau_hi, torch.ones_like(mode_state, dtype=torch.bool), mode_state)
-        mode_state = torch.where(ratio < tau_lo, torch.zeros_like(mode_state, dtype=torch.bool), mode_state)
+            
+        new_mode = mode_state.clone()
+        new_mode = torch.where(ratio > tau_hi, torch.ones_like(new_mode, dtype=torch.bool), new_mode)
+        new_mode = torch.where(ratio < tau_lo, torch.zeros_like(new_mode, dtype=torch.bool), new_mode)
+        mode_state = new_mode
         return mode_state
 
     def modifier(args, state: GuidanceState) -> GuidanceState:
@@ -521,6 +514,9 @@ def make_zeresfdg_modifier(
             rho = beta * rho + (1 - beta) * r_hf.detach()
 
         mode = update_mode(rho)
+        
+        # Mandatory transparency: Log the internal state to console
+        logging.info(f"ZeResFDG Status | r_hf: {r_hf.mean().item():.4f} | rho (EMA): {rho.mean().item():.4f} | Mode: {'RescaleFDG (Alpha Active)' if mode.any() else 'CFGZeroFD (Conservative)'}")
 
         residual_low = gaussian_lowpass(residual)
         residual_high = residual - residual_low
@@ -542,8 +538,8 @@ def make_zeresfdg_modifier(
 
         if mode.dtype != torch.bool:
             mode = mode > 0
-        mode = mode.view(batch_size, *([1] * (rescale_term.dim() - 1)))
-        combined_guidance = rescale_term * mode + conservative_term * (~mode)
+        mode_expanded = mode.view(batch_size, *([1] * (rescale_term.dim() - 1)))
+        combined_guidance = rescale_term * mode_expanded + conservative_term * (~mode_expanded)
 
         return GuidanceState(state.base_prediction, combined_guidance)
 
