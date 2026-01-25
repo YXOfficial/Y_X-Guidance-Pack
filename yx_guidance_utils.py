@@ -516,40 +516,49 @@ def make_zeresfdg_modifier(
         mode = update_mode(rho)
         
         # Mandatory transparency: Log the internal state to console
-        current_mode_name = 'RescaleFDG (Alpha Active)' if mode.any() else 'CFGZeroFD (Conservative)'
-        logging.info(f"ZeResFDG Status | r_hf: {r_hf.mean().item():.4f} | rho (EMA): {rho.mean().item():.4f} | Mode: {current_mode_name}")
+        # current_mode_name = 'RescaleFDG (Alpha Active)' if mode.any() else 'CFGZeroFD (Conservative)'
+        # logging.info(f"ZeResFDG Status | r_hf: {r_hf.mean().item():.4f} | rho (EMA): {rho.mean().item():.4f} | Mode: {current_mode_name}")
 
-        # 1. Conservative Path (CFG-Zero + FDG)
+        # Ensure mode is a float mask [0.0, 1.0] for direct multiplication
+        m = mode.to(dtype=cond_denoised.dtype).view(batch_size, *([1] * (cond_denoised.dim() - 1)))
+
+        # 1. Conservative Branch (CFG-Zero foundation)
+        # Base is the projected uncond from the builder
+        cons_base = state.base_prediction
+        
         residual_low = gaussian_lowpass(residual)
         residual_high = residual - residual_low
         fdg_residual = w_low * residual_low + w_high * residual_high
         fdg_residual = apply_mask(fdg_residual, guidance_mask)
-        conservative_guidance = fdg_residual * cond_scale
-        conservative_base = state.base_prediction
+        cons_guidance = fdg_residual * cond_scale
 
-        # 2. Detail-seeking Path (Rescale + FDG)
+        # 2. Rescale Branch (Standard CFG foundation)
+        # Base MUST be the raw uncond for rescale to work
+        rescale_base = uncond_denoised
+        
         fdg_delta = w_low * delta_low + w_high * delta_high
         fdg_delta = apply_mask(fdg_delta, guidance_mask)
         y_cfg = uncond_denoised + cond_scale * fdg_delta
 
         dims = tuple(range(1, cond_denoised.dim()))
+        # Match energy to cond_denoised (positive branch)
         target_std = cond_denoised.std(dim=dims, keepdim=True)
         y_cfg_std = y_cfg.std(dim=dims, keepdim=True)
-        rescale_factor = torch.where(y_cfg_std > 0, target_std / (y_cfg_std + eps), torch.ones_like(target_std))
+        
+        # Calculate factor, handle potential division by zero
+        rescale_factor = target_std / (y_cfg_std + eps)
         y_rescaled = y_cfg * rescale_factor
-        rescaled_prediction = alpha * y_rescaled + (1 - alpha) * y_cfg
         
-        # In Rescale mode, the base MUST be uncond_denoised as per Algorithm 1
-        rescale_guidance = rescaled_prediction - uncond_denoised
-        rescale_base = uncond_denoised
+        # Apply Alpha blending
+        y_final = alpha * y_rescaled + (1.0 - alpha) * y_cfg
+        rescale_guidance = y_final - rescale_base
 
-        # 3. Dynamic Switching
-        if mode.dtype != torch.bool:
-            mode = mode > 0
-        mode_expanded = mode.view(batch_size, *([1] * (rescaled_prediction.dim() - 1)))
-        
-        final_base = torch.where(mode_expanded, rescale_base, conservative_base)
-        final_guidance = torch.where(mode_expanded, rescale_guidance, conservative_guidance)
+        # 3. Final Blending (Hard Switch)
+        # result = (1-m)*Conservative + m*Rescale
+        final_base = (1.0 - m) * cons_base + m * rescale_base
+        final_guidance = (1.0 - m) * cons_guidance + m * rescale_guidance
+
+        logging.info(f"ZeResFDG | rho: {rho.mean().item():.3f} | Mode: {'RESCALE' if m.mean() > 0.5 else 'ZERO'} | BaseDiff: {(rescale_base - cons_base).abs().mean().item():.6f}")
 
         return GuidanceState(final_base, final_guidance)
 
