@@ -515,50 +515,44 @@ def make_zeresfdg_modifier(
 
         mode = update_mode(rho)
         
-        # Mandatory transparency: Log the internal state to console
-        # current_mode_name = 'RescaleFDG (Alpha Active)' if mode.any() else 'CFGZeroFD (Conservative)'
-        # logging.info(f"ZeResFDG Status | r_hf: {r_hf.mean().item():.4f} | rho (EMA): {rho.mean().item():.4f} | Mode: {current_mode_name}")
-
         # Ensure mode is a float mask [0.0, 1.0] for direct multiplication
         m = mode.to(dtype=cond_denoised.dtype).view(batch_size, *([1] * (cond_denoised.dim() - 1)))
 
         # 1. Conservative Branch (CFG-Zero foundation)
-        # Base is the projected uncond from the builder
         cons_base = state.base_prediction
-        
         residual_low = gaussian_lowpass(residual)
         residual_high = residual - residual_low
         fdg_residual = w_low * residual_low + w_high * residual_high
         fdg_residual = apply_mask(fdg_residual, guidance_mask)
         cons_guidance = fdg_residual * cond_scale
+        cons_final = cons_base + cons_guidance
 
         # 2. Rescale Branch (Standard CFG foundation)
-        # Base MUST be the raw uncond for rescale to work
-        rescale_base = uncond_denoised
-        
         fdg_delta = w_low * delta_low + w_high * delta_high
         fdg_delta = apply_mask(fdg_delta, guidance_mask)
         y_cfg = uncond_denoised + cond_scale * fdg_delta
 
         dims = tuple(range(1, cond_denoised.dim()))
-        # Match energy to cond_denoised (positive branch)
         target_std = cond_denoised.std(dim=dims, keepdim=True)
         y_cfg_std = y_cfg.std(dim=dims, keepdim=True)
         
-        # Calculate factor, handle potential division by zero
-        rescale_factor = target_std / (y_cfg_std + eps)
-        y_rescaled = y_cfg * rescale_factor
+        # Hard Rescale Factor
+        r_factor = target_std / (y_cfg_std + eps)
+        y_rescaled = y_cfg * r_factor
         
-        # Apply Alpha blending
+        # Direct Alpha Blend
         y_final = alpha * y_rescaled + (1.0 - alpha) * y_cfg
-        rescale_guidance = y_final - rescale_base
+        
+        # 3. Final Forced Switch
+        # If m=1, we return y_final. If m=0, we return cons_final.
+        final_output = (1.0 - m) * cons_final + m * y_final
+        
+        # New forced base/guidance split for the pipeline
+        final_base = (1.0 - m) * cons_base + m * uncond_denoised
+        final_guidance = final_output - final_base
 
-        # 3. Final Blending (Hard Switch)
-        # result = (1-m)*Conservative + m*Rescale
-        final_base = (1.0 - m) * cons_base + m * rescale_base
-        final_guidance = (1.0 - m) * cons_guidance + m * rescale_guidance
-
-        logging.info(f"ZeResFDG | rho: {rho.mean().item():.3f} | Mode: {'RESCALE' if m.mean() > 0.5 else 'ZERO'} | BaseDiff: {(rescale_base - cons_base).abs().mean().item():.6f}")
+        # Brute-force transparency:
+        logging.info(f"ZeResFDG | rho:{rho.mean().item():.3f} | Mode:{'RESCALE' if m.mean() > 0.5 else 'ZERO'} | Factor:{r_factor.mean().item():.3f} | Alpha:{alpha} | TargetStd:{target_std.mean().item():.3f}")
 
         return GuidanceState(final_base, final_guidance)
 
