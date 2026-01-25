@@ -542,6 +542,12 @@ def make_zeresfdg_modifier(
             guidance_r = torch.zeros_like(y_target_rescale)
 
         # --- BLENDING ---
+        # Re-assemble the final base and guidance
+        final_base = (1.0 - m) * u_proj + m * uncond_denoised
+        final_guidance = (1.0 - m) * guidance_z + m * guidance_r
+
+        logging.info(f"ZeResFDG | rho:{rho.mean().item():.4f} | r_hf:{r_hf.mean().item():.4f} | Mode:{'RESCALE' if m.mean() > 0.5 else 'ZERO'}")
+        return GuidanceState(final_base, final_guidance)
 
         logging.info(f"ZeResFDG | rho:{rho.mean().item():.4f} | r_hf:{r_hf.mean().item():.4f} | Mode:{'RESCALE' if m.mean() > 0.5 else 'ZERO'}")
         return GuidanceState(final_base, final_guidance)
