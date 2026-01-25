@@ -102,14 +102,14 @@ def qsilk_micrograin(
     m = 0.5 * (l + h)
     delta = 0.5 * (h - l)
 
-    y = (x32 - m) / (delta + 1e-6)
+    y = (x32 - m) / (delta + 1e-4)
     x_soft = m + delta * torch.tanh(alpha * y)
 
     mu1 = x_soft.mean(dim=dims, keepdim=True)
     var1 = x_soft.var(dim=dims, unbiased=False, keepdim=True)
-    std1 = torch.sqrt(var1 + 1e-6)
+    std1 = torch.sqrt(var1 + 1e-4)
 
-    y2 = (x_soft - mu1) / (std1 + 1e-6)
+    y2 = (x_soft - mu1) / (std1 + 1e-4)
     x_vp = y2 * std0 + mu0
 
     mix = float(max(0.0, min(1.0, vp_mix)))
@@ -198,8 +198,12 @@ def qsilk_aqclip_lite(
     patched = m + delta * torch.tanh(alpha * normed)
 
     x_clipped_flat = fold(patched)
-    norm = fold(unfold(torch.ones_like(x_flat)))
-    x_clipped_flat = x_clipped_flat / (norm + eps)
+    
+    # Normalization map (fold(1))
+    ones = torch.ones_like(x_flat)
+    norm_map = fold(unfold(ones))
+    
+    x_clipped_flat = x_clipped_flat / (norm_map + 1e-4)
     x_clipped = x_clipped_flat.view(b, c, h, w)
 
     return x_clipped.to(dtype=dtype), ema_state
