@@ -417,70 +417,45 @@ def make_zeresfdg_modifier(
     controller_enabled: bool,
     sigma: float = 1.0,
 ):
-    eps = 1e-8
+    eps = 1e-12
     rho = None
     mode_state = None
 
     def gaussian_lowpass(tensor: torch.Tensor) -> torch.Tensor:
         input_dim = tensor.dim()
-        if input_dim == 3:
-            x = tensor.unsqueeze(0)
-        elif input_dim == 4:
-            x = tensor
-        else:
-            raise ValueError(f"ZeResFDG: Expected 3D or 4D tensor, got {input_dim}D (shape: {tensor.shape})")
-            
-        kernel_size = int(max(3, 2 * round(3 * sigma) + 1))
-        if kernel_size % 2 == 0:
-            kernel_size += 1
-            
-        out = gaussian_blur2d(
-            x,
-            kernel_size=(kernel_size, kernel_size),
-            sigma=(sigma, sigma),
-            border_type="reflect",
-        )
+        x = tensor.unsqueeze(0) if input_dim == 3 else tensor
+        k_size = int(max(3, 2 * round(3 * sigma) + 1))
+        if k_size % 2 == 0: k_size += 1
+        out = gaussian_blur2d(x, kernel_size=(k_size, k_size), sigma=(sigma, sigma), border_type="reflect")
         return out.squeeze(0) if input_dim == 3 else out
 
     def ensure_mask(mask, target: torch.Tensor) -> torch.Tensor:
-        if mask is None:
-            return None
+        if mask is None: return None
         if not torch.is_tensor(mask):
             mask = torch.tensor(mask, device=target.device, dtype=target.dtype)
         else:
             mask = mask.to(device=target.device, dtype=target.dtype)
-
-        if mask.dim() == 2:
-            mask = mask.unsqueeze(0).unsqueeze(0)
-        elif mask.dim() == 3:
-            mask = mask.unsqueeze(1)
-
+        if mask.dim() == 2: mask = mask.unsqueeze(0).unsqueeze(0)
+        elif mask.dim() == 3: mask = mask.unsqueeze(1)
         if mask.shape[0] == 1 and target.shape[0] > 1:
             mask = mask.expand(target.shape[0], *mask.shape[1:])
-
         if mask.shape[-2:] != target.shape[-2:]:
             mask = F.interpolate(mask, size=target.shape[-2:], mode="bilinear", align_corners=False)
-
         if mask.shape[1] == 1 and target.shape[1] > 1:
             mask = mask.expand(target.shape[0], target.shape[1], *mask.shape[-2:])
-
         return mask
 
     def apply_mask(tensor: torch.Tensor, mask) -> torch.Tensor:
         mask_tensor = ensure_mask(mask, tensor)
-        if mask_tensor is None:
-            return tensor
+        if mask_tensor is None: return tensor
         return tensor * mask_tensor
 
     def update_mode(ratio: torch.Tensor):
         nonlocal mode_state
         if not controller_enabled:
-            mode_state = torch.ones_like(ratio, dtype=torch.bool)
-            return mode_state
-
+            return torch.ones_like(ratio, dtype=torch.bool)
         if mode_state is None or mode_state.shape != ratio.shape:
             mode_state = ratio > tau_hi
-            
         new_mode = mode_state.clone()
         new_mode = torch.where(ratio > tau_hi, torch.ones_like(new_mode, dtype=torch.bool), new_mode)
         new_mode = torch.where(ratio < tau_lo, torch.zeros_like(new_mode, dtype=torch.bool), new_mode)
@@ -494,67 +469,58 @@ def make_zeresfdg_modifier(
         uncond_denoised = args["uncond_denoised"]
         guidance_mask = args.get("guidance_mask") or args.get("mask") or args.get("g")
 
-        if cond_scale != 0:
-            residual = state.guidance_term / cond_scale
-        else:
-            residual = state.guidance_term
-
+        # 1. FDG: Delta = yc - yu
         delta = cond_denoised - uncond_denoised
-        delta_low = gaussian_lowpass(delta)
-        delta_high = delta - delta_low
+        delta_l = gaussian_lowpass(delta)
+        delta_h = delta - delta_l
 
+        # 2. Spectral Controller (Energy Sum of Squares)
         batch_size = delta.shape[0]
-        low_norm = torch.sum(delta_low.reshape(batch_size, -1) ** 2, dim=1)
-        high_norm = torch.sum(delta_high.reshape(batch_size, -1) ** 2, dim=1)
-        r_hf = high_norm / (low_norm + high_norm + eps)
+        d_l_f = delta_l.reshape(batch_size, -1).to(torch.float32)
+        d_h_f = delta_h.reshape(batch_size, -1).to(torch.float32)
+        l_energy = torch.sum(d_l_f ** 2, dim=1)
+        h_energy = torch.sum(d_h_f ** 2, dim=1)
+        r_hf = h_energy / (l_energy + h_energy + eps)
+        r_hf = r_hf.to(cond_denoised.dtype)
 
+        # EMA Update: rho = beta * rho + (1 - beta) * r_hf
         if rho is None or rho.shape != r_hf.shape:
             rho = r_hf.detach()
         else:
             rho = beta * rho + (1 - beta) * r_hf.detach()
 
         mode = update_mode(rho)
-        
-        # Ensure mode is a float mask [0.0, 1.0] for direct multiplication
         m = mode.to(dtype=cond_denoised.dtype).view(batch_size, *([1] * (cond_denoised.dim() - 1)))
 
-        # 1. Conservative Branch (CFG-Zero foundation)
-        cons_base = state.base_prediction
-        residual_low = gaussian_lowpass(residual)
-        residual_high = residual - residual_low
-        fdg_residual = w_low * residual_low + w_high * residual_high
-        fdg_residual = apply_mask(fdg_residual, guidance_mask)
-        cons_guidance = fdg_residual * cond_scale
-        cons_final = cons_base + cons_guidance
+        # 3. Path Calculation
+        # Path A: Conservative (CFG-Zero based)
+        if cond_scale != 0:
+            res = state.guidance_term / cond_scale
+        else:
+            res = state.guidance_term
+        res_l = gaussian_lowpass(res)
+        res_h = res - res_l
+        y_cons = state.base_prediction + (w_low * res_l + w_high * res_h) * cond_scale
+        y_cons = apply_mask(y_cons, guidance_mask) # Simplified for clarity
 
-        # 2. Rescale Branch (Standard CFG foundation)
-        fdg_delta = w_low * delta_low + w_high * delta_high
-        fdg_delta = apply_mask(fdg_delta, guidance_mask)
-        y_cfg = uncond_denoised + cond_scale * fdg_delta
-
+        # Path B: Detail-seeking (Rescale based)
+        y_cfg = uncond_denoised + cond_scale * (w_low * delta_l + w_high * delta_h)
+        y_cfg = apply_mask(y_cfg, guidance_mask)
         dims = tuple(range(1, cond_denoised.dim()))
-        target_std = cond_denoised.std(dim=dims, keepdim=True)
-        y_cfg_std = y_cfg.std(dim=dims, keepdim=True)
-        
-        # Hard Rescale Factor
-        r_factor = target_std / (y_cfg_std + eps)
-        y_rescaled = y_cfg * r_factor
-        
-        # Direct Alpha Blend
-        y_final = alpha * y_rescaled + (1.0 - alpha) * y_cfg
-        
-        # 3. Final Forced Switch
-        # If m=1, we return y_final. If m=0, we return cons_final.
-        final_output = (1.0 - m) * cons_final + m * y_final
-        
-        # New forced base/guidance split for the pipeline
-        final_base = (1.0 - m) * cons_base + m * uncond_denoised
+        t_std = cond_denoised.std(dim=dims, keepdim=True)
+        c_std = y_cfg.std(dim=dims, keepdim=True)
+        r_fac = t_std / (c_std + eps)
+        y_det = alpha * (y_cfg * r_fac) + (1.0 - alpha) * y_cfg
+
+        # Final Blending
+        final_output = (1.0 - m) * y_cons + m * y_det
+        final_base = (1.0 - m) * state.base_prediction + m * uncond_denoised
         final_guidance = final_output - final_base
 
-        # Brute-force transparency:
-        logging.info(f"ZeResFDG | rho:{rho.mean().item():.3f} | Mode:{'RESCALE' if m.mean() > 0.5 else 'ZERO'} | Factor:{r_factor.mean().item():.3f} | Alpha:{alpha} | TargetStd:{target_std.mean().item():.3f}")
-
+        logging.info(f"ZeResFDG | rho:{rho.mean().item():.4f} | r_hf:{r_hf.mean().item():.4f} | Mode:{'RESCALE' if mode.any() else 'ZERO'}")
         return GuidanceState(final_base, final_guidance)
+
+    return modifier
 
     return modifier
 
