@@ -494,55 +494,51 @@ def make_zeresfdg_modifier(
         
         target_std = cond_denoised.std(dim=dims, keepdim=True)
 
-        # --- BRANCH 1: Zero-Projection (Conservative) ---
-        # Paper: delta = yc - alpha_parallel * yu
-        # state.base_prediction already holds (alpha_parallel * yu)
+        # --- BRANCH 1: ZERO (Conservative / Zero-Projection) ---
+        # Algorithm 1 Step 4: No Rescale here.
+        # Base = u_proj (alpha_parallel * yu)
+        # Target y = Base + s * FDG(r)
+        # Therefore, Guidance = FDG(r)
+        
         u_proj = state.base_prediction
-        delta_zero = cond_denoised - u_proj
-        dl_zero = gaussian_lowpass(delta_zero)
-        dh_zero = delta_zero - dl_zero
+        delta_z = cond_denoised - u_proj
+        dl_z = gaussian_lowpass(delta_z)
+        dh_z = delta_z - dl_z
         
-        # FDG(delta) = w_low * dl + w_high * dh
-        fdg_zero = w_low * dl_zero + w_high * dh_zero
-        if guidance_mask is not None:
-            fdg_zero = apply_mask(fdg_zero, guidance_mask)
+        fdg_z = w_low * dl_z + w_high * dh_z
+        if g_mask is not None: 
+            fdg_z = fdg_z * g_mask
+            
+        # Direct assignment, no scaling or rescaling logic needed for guidance term
+        guidance_z = fdg_z
         
-        # Paper Algorithm 1 Line 13: Rescale(u_proj + FDG(delta), std(yc))
-        y_zero_raw = u_proj + fdg_zero
-        y_zero_std = y_zero_raw.std(dim=dims, keepdim=True)
-        y_zero = y_zero_raw * (target_std / (y_zero_std + eps))
+        # --- BRANCH 2: RESCALE (Detail-seeking) ---
+        # Algorithm 1 Step 5: Rescale is applied here.
         
-        # Normalize Branch 1 for the outer pipeline
-        if abs(cond_scale) > 1e-6:
-            guidance_z = (y_zero - u_proj) / cond_scale
-        else:
-            guidance_z = torch.zeros_like(y_zero)
-        
-        # --- BRANCH 2: Rescale (Detail-seeking) ---
-        # 1. Simulate the full CFG effect (High Contrast / Potential Burn)
+        # 1. Simulate y_cfg = yu + s * FDG(yc - yu)
         fdg_rescale = w_low * dl_rescale + w_high * dh_rescale
-        if guidance_mask is not None:
-            fdg_rescale = apply_mask(fdg_rescale, guidance_mask)
-        
-        # y_cfg must reflect the ACTUAL projected image at the current scale
+        if g_mask is not None: 
+            fdg_rescale = fdg_rescale * g_mask
+            
         y_cfg_sim = uncond_denoised + cond_scale * fdg_rescale
         
-        # 2. Apply Rescale to the high-contrast simulation
+        # 2. Rescale & Blend
         y_cfg_std = y_cfg_sim.std(dim=dims, keepdim=True)
-        y_cfg_rescaled = y_cfg_sim * (target_std / (y_cfg_std + eps))
+        # Safety: avoid div by zero
+        r_factor = target_std / (y_cfg_std + eps)
+        y_cfg_rescaled = y_cfg_sim * r_factor
         
-        # 3. Alpha Blend
         y_target_rescale = alpha * y_cfg_rescaled + (1.0 - alpha) * y_cfg_sim
         
-        # 4. Reverse-Engineer the Guidance Vector
-        # Output = Uncond + Scale * Guidance  =>  Guidance = (Output - Uncond) / Scale
+        # 3. Reverse-Engineer Guidance
+        # y_target = yu + s * guidance_r  =>  guidance_r = (y_target - yu) / s
         if abs(cond_scale) > 1e-6:
             guidance_r = (y_target_rescale - uncond_denoised) / cond_scale
         else:
             guidance_r = torch.zeros_like(y_target_rescale)
 
         # --- BLENDING ---
-        # Re-assemble the final base and guidance
+        # Final Base switches between u_proj (Zero mode) and yu (Rescale mode)
         final_base = (1.0 - m) * u_proj + m * uncond_denoised
         final_guidance = (1.0 - m) * guidance_z + m * guidance_r
 
